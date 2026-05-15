@@ -42,7 +42,7 @@ def get_next_test_run_number(nc_client) -> int:
     Check existing test_run_NN directories and return the next number.
     """
     batch_path = f"{NC_RAW_PATH}/{BATCH_NAME}"
-    existing = nc_client.list_directory(batch_path)
+    existing = nc_client.list_dir(batch_path)
 
     max_num = 0
     for entry in existing:
