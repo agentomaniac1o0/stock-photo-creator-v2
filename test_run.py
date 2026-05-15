@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Real-Life Test Run: Process 30 RAW files from SW-England-May26-01.
-Output goes to test_run_01/ subdirectory for quality review.
+Real-Life Test Run: Process RAW files from SW-England-May26-01.
+Auto-increments test run number and uploads to test_run_NN/ subdirectory.
 """
 import logging
 import sys
@@ -16,7 +16,15 @@ from modules.bracket_detector import detect_brackets, print_group_summary
 from modules.overexposure_checker import check_overexposure
 from modules.exposure_aligner import align_exposures
 from modules.quality_scorer import score_all_images
-from modules.selector import select_and_upload
+from modules.selector import (
+    select_from_aeb_group,
+    select_from_burst_group,
+    select_from_single,
+    generate_selection_report,
+    upload_files,
+    SelectionResult,
+    SelectionDecision,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,22 +34,45 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BATCH_NAME = "SW-England-May26-01"
-TEST_OUTPUT = f"{NC_RAW_PATH}/{BATCH_NAME}/test_run_01"
-MAX_IMAGES = 30
+MAX_IMAGES = 50
+
+
+def get_next_test_run_number(nc_client) -> int:
+    """
+    Check existing test_run_NN directories and return the next number.
+    """
+    batch_path = f"{NC_RAW_PATH}/{BATCH_NAME}"
+    existing = nc_client.list_directory(batch_path)
+
+    max_num = 0
+    for entry in existing:
+        name = entry.get("name", "")
+        if name.startswith("test_run_"):
+            try:
+                num = int(name.replace("test_run_", ""))
+                max_num = max(max_num, num)
+            except ValueError:
+                pass
+
+    return max_num + 1
 
 
 def main():
-    logger.info("=" * 60)
-    logger.info("  REAL-LIFE TEST RUN")
-    logger.info(f"  Batch: {BATCH_NAME}")
-    logger.info(f"  Max images: {MAX_IMAGES}")
-    logger.info(f"  Output: {TEST_OUTPUT}")
-    logger.info("=" * 60)
-
     nc_client = init_nextcloud()
     if nc_client is None:
         logger.error("Nextcloud credentials not found.")
         sys.exit(1)
+
+    test_run_num = get_next_test_run_number(nc_client)
+    test_run_label = f"test_run_{test_run_num:02d}"
+    test_output = f"{NC_RAW_PATH}/{BATCH_NAME}/{test_run_label}"
+
+    logger.info("=" * 60)
+    logger.info("  REAL-LIFE TEST RUN")
+    logger.info(f"  Batch: {BATCH_NAME}")
+    logger.info(f"  Max images: {MAX_IMAGES}")
+    logger.info(f"  Output: {test_output}")
+    logger.info("=" * 60)
 
     # Step 1: Import
     logger.info("\n" + "=" * 60)
@@ -106,22 +137,10 @@ def main():
 
     groups = quality_result.scored_groups
 
-    # Step 6: Selection + Upload to test_run_01
+    # Step 6: Selection + Upload to test_run_NN
     logger.info("\n" + "=" * 60)
-    logger.info("STEP 6: Selection + Upload to test_run_01")
+    logger.info(f"STEP 6: Selection + Upload to {test_run_label}")
     logger.info("=" * 60)
-
-    # Custom upload to test_run_01 directory
-    from modules.selector import (
-        select_from_aeb_group,
-        select_from_burst_group,
-        select_from_single,
-        generate_selection_report,
-        upload_files,
-        SelectionResult,
-        SelectionDecision,
-    )
-    from modules.quality_scorer import QualityScore
 
     all_decisions = []
     all_kept = []
@@ -146,25 +165,25 @@ def main():
 
     # Generate report
     report_path = generate_selection_report(
-        all_decisions, f"{BATCH_NAME}_test_run_01", import_result.temp_dir
+        all_decisions, f"{BATCH_NAME}_{test_run_label}", import_result.temp_dir
     )
 
-    # Upload to test_run_01
-    nc_cleaned = f"{TEST_OUTPUT}/cleaned"
-    nc_rejected = f"{TEST_OUTPUT}/rejected"
+    # Upload to test_run_NN
+    nc_selected = f"{test_output}/selected"
+    nc_rejected = f"{test_output}/rejected"
 
-    upload_success, upload_failed = upload_files(all_kept, nc_client, nc_cleaned)
+    upload_success, upload_failed = upload_files(all_kept, nc_client, nc_selected)
     rej_success, rej_failed = upload_files(all_rejected, nc_client, nc_rejected)
     upload_success += rej_success
     upload_failed += rej_failed
 
     # Upload report
-    nc_client.upload_file(report_path, f"{TEST_OUTPUT}/selection_report.json")
+    nc_client.upload_file(report_path, f"{test_output}/selection_report.json")
 
     # Update destinations
     for d in all_decisions:
         if d.decision == "keep":
-            d.destination = f"{nc_cleaned}/{d.filepath.name}"
+            d.destination = f"{nc_selected}/{d.filepath.name}"
         else:
             d.destination = f"{nc_rejected}/{d.filepath.name}"
 
@@ -185,9 +204,9 @@ def main():
     logger.info("\n" + "=" * 60)
     logger.info("  TEST RUN COMPLETE")
     logger.info("=" * 60)
-    logger.info(f"  Kept files:   {TEST_OUTPUT}/cleaned/")
-    logger.info(f"  Rejected:     {TEST_OUTPUT}/rejected/")
-    logger.info(f"  Report:       {TEST_OUTPUT}/selection_report.json")
+    logger.info(f"  Selected:     {test_output}/selected/")
+    logger.info(f"  Rejected:     {test_output}/rejected/")
+    logger.info(f"  Report:       {test_output}/selection_report.json")
     logger.info("")
     logger.info("  Bitte prüfe die Ergebnisse in Nextcloud und gib Feedback.")
 

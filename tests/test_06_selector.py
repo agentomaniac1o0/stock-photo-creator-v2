@@ -11,10 +11,13 @@ from modules.quality_scorer import QualityScore, QualityScorerResult
 from modules.selector import (
     SelectionDecision,
     SelectionResult,
+    passes_exposure_gate,
     select_from_aeb_group,
     select_from_burst_group,
     select_from_single,
     select_and_upload,
+    EXPOSURE_GATE_MIN,
+    NOISE_GATE_MIN,
 )
 
 
@@ -31,6 +34,64 @@ class TestSelectionDecision(unittest.TestCase):
         self.assertEqual(d.score, 85.0)
 
 
+class TestExposureGate(unittest.TestCase):
+
+    def test_passes_good_image(self):
+        score = QualityScore(
+            filepath=Path("good.CR2"),
+            overall_score=80.0,
+            exposure_score=85.0,
+            noise_score=80.0,
+            sharpness_score=70.0,
+            detail_score=75.0,
+            defect_score=90.0,
+        )
+        passes, reason = passes_exposure_gate(score)
+        self.assertTrue(passes)
+
+    def test_fails_underexposed(self):
+        score = QualityScore(
+            filepath=Path("dark.CR2"),
+            overall_score=60.0,
+            exposure_score=15.0,
+            noise_score=70.0,
+            sharpness_score=80.0,
+            detail_score=60.0,
+            defect_score=85.0,
+        )
+        passes, reason = passes_exposure_gate(score)
+        self.assertFalse(passes)
+        self.assertIn("Underexposed", reason)
+
+    def test_fails_noisy(self):
+        score = QualityScore(
+            filepath=Path("noisy.CR2"),
+            overall_score=55.0,
+            exposure_score=70.0,
+            noise_score=20.0,
+            sharpness_score=75.0,
+            detail_score=60.0,
+            defect_score=80.0,
+        )
+        passes, reason = passes_exposure_gate(score)
+        self.assertFalse(passes)
+        self.assertIn("Noisy", reason)
+
+    def test_fails_both(self):
+        score = QualityScore(
+            filepath=Path("terrible.CR2"),
+            overall_score=30.0,
+            exposure_score=10.0,
+            noise_score=15.0,
+            sharpness_score=40.0,
+            detail_score=30.0,
+            defect_score=50.0,
+        )
+        passes, reason = passes_exposure_gate(score)
+        self.assertFalse(passes)
+        self.assertIn("Underexposed", reason)
+
+
 class TestSelectFromAebGroup(unittest.TestCase):
 
     def _make_aeb_group(self) -> BracketGroup:
@@ -45,15 +106,15 @@ class TestSelectFromAebGroup(unittest.TestCase):
         )
 
     def test_keeps_only_best(self):
-        """AEB group should keep only the best image."""
+        """AEB group should keep only the best image that passes exposure gate."""
         group = self._make_aeb_group()
         scores = [
             QualityScore(filepath=Path("best.CR2"), overall_score=90.0,
-                        sharpness_score=90, noise_score=90, detail_score=90, defect_score=90),
+                        exposure_score=85, sharpness_score=90, noise_score=90, detail_score=90, defect_score=90),
             QualityScore(filepath=Path("mid.CR2"), overall_score=75.0,
-                        sharpness_score=75, noise_score=75, detail_score=75, defect_score=75),
+                        exposure_score=70, sharpness_score=75, noise_score=75, detail_score=75, defect_score=75),
             QualityScore(filepath=Path("dark.CR2"), overall_score=60.0,
-                        sharpness_score=60, noise_score=60, detail_score=60, defect_score=60),
+                        exposure_score=20, sharpness_score=60, noise_score=60, detail_score=60, defect_score=60),
         ]
 
         kept, decisions = select_from_aeb_group(group, scores)
@@ -61,11 +122,55 @@ class TestSelectFromAebGroup(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0], Path("best.CR2"))
 
-        # One keep, two rejects
         keep_decisions = [d for d in decisions if d.decision == "keep"]
         reject_decisions = [d for d in decisions if d.decision == "reject"]
         self.assertEqual(len(keep_decisions), 1)
         self.assertEqual(len(reject_decisions), 2)
+
+    def test_rejects_underexposed_best(self):
+        """If the best overall score is underexposed, pick next best that passes gate."""
+        group = BracketGroup(
+            group_type=GroupType.AEB,
+            files=[
+                FileExifData(filepath=Path("sharp_dark.CR2"), exposure_compensation=-2.0),
+                FileExifData(filepath=Path("well_lit.CR2"), exposure_compensation=0.0),
+            ],
+            group_id=1,
+        )
+        scores = [
+            QualityScore(filepath=Path("sharp_dark.CR2"), overall_score=85.0,
+                        exposure_score=15, sharpness_score=95, noise_score=40, detail_score=90, defect_score=90),
+            QualityScore(filepath=Path("well_lit.CR2"), overall_score=70.0,
+                        exposure_score=80, sharpness_score=65, noise_score=75, detail_score=70, defect_score=80),
+        ]
+
+        kept, decisions = select_from_aeb_group(group, scores)
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0], Path("well_lit.CR2"))
+
+    def test_rejects_all_if_none_pass_gate(self):
+        """If ALL images fail the exposure gate, reject ALL."""
+        group = BracketGroup(
+            group_type=GroupType.AEB,
+            files=[
+                FileExifData(filepath=Path("dark1.CR2"), exposure_compensation=-2.0),
+                FileExifData(filepath=Path("dark2.CR2"), exposure_compensation=-3.0),
+            ],
+            group_id=1,
+        )
+        scores = [
+            QualityScore(filepath=Path("dark1.CR2"), overall_score=60.0,
+                        exposure_score=10, sharpness_score=70, noise_score=20, detail_score=60, defect_score=70),
+            QualityScore(filepath=Path("dark2.CR2"), overall_score=55.0,
+                        exposure_score=8, sharpness_score=65, noise_score=15, detail_score=55, defect_score=65),
+        ]
+
+        kept, decisions = select_from_aeb_group(group, scores)
+
+        self.assertEqual(len(kept), 0)
+        self.assertEqual(len(decisions), 2)
+        self.assertTrue(all(d.decision == "reject" for d in decisions))
 
     def test_empty_group(self):
         """Empty group should return empty results."""
@@ -97,11 +202,11 @@ class TestSelectFromBurstGroup(unittest.TestCase):
         group = self._make_burst_group()
         scores = [
             QualityScore(filepath=Path("good1.CR2"), overall_score=80.0,
-                        sharpness_score=80, noise_score=80, detail_score=80, defect_score=80),
+                        exposure_score=80, sharpness_score=80, noise_score=80, detail_score=80, defect_score=80),
             QualityScore(filepath=Path("good2.CR2"), overall_score=70.0,
-                        sharpness_score=70, noise_score=70, detail_score=70, defect_score=70),
+                        exposure_score=70, sharpness_score=70, noise_score=70, detail_score=70, defect_score=70),
             QualityScore(filepath=Path("bad.CR2"), overall_score=40.0,
-                        sharpness_score=40, noise_score=40, detail_score=40, defect_score=40),
+                        exposure_score=40, sharpness_score=40, noise_score=40, detail_score=40, defect_score=40),
         ]
 
         kept, decisions = select_from_burst_group(group, scores, min_score=60.0)
@@ -123,7 +228,7 @@ class TestSelectFromSingle(unittest.TestCase):
         )
         scores = [
             QualityScore(filepath=Path("solo.CR2"), overall_score=75.0,
-                        sharpness_score=75, noise_score=75, detail_score=75, defect_score=75),
+                        exposure_score=75, sharpness_score=75, noise_score=75, detail_score=75, defect_score=75),
         ]
 
         kept, decisions = select_from_single(group, scores, min_score=50.0)
@@ -140,7 +245,7 @@ class TestSelectFromSingle(unittest.TestCase):
         )
         scores = [
             QualityScore(filepath=Path("solo.CR2"), overall_score=30.0,
-                        sharpness_score=30, noise_score=30, detail_score=30, defect_score=30),
+                        exposure_score=30, sharpness_score=30, noise_score=30, detail_score=30, defect_score=30),
         ]
 
         kept, decisions = select_from_single(group, scores, min_score=50.0)
@@ -176,8 +281,7 @@ class TestSelectionResult(unittest.TestCase):
         )
 
         summary = result.summary()
-        self.assertIn("1", summary)  # kept count
-        self.assertIn("1", summary)  # rejected count
+        self.assertIn("1", summary)
         self.assertIn("kept.CR2", summary)
         self.assertIn("rejected.CR2", summary)
 
@@ -213,11 +317,11 @@ class TestSelectAndUpload(unittest.TestCase):
             ],
             scores=[
                 QualityScore(filepath=Path("best.CR2"), overall_score=90.0,
-                            sharpness_score=90, noise_score=90, detail_score=90, defect_score=90),
+                            exposure_score=85, sharpness_score=90, noise_score=90, detail_score=90, defect_score=90),
                 QualityScore(filepath=Path("dark.CR2"), overall_score=60.0,
-                            sharpness_score=60, noise_score=60, detail_score=60, defect_score=60),
+                            exposure_score=15, sharpness_score=60, noise_score=20, detail_score=60, defect_score=60),
                 QualityScore(filepath=Path("solo.CR2"), overall_score=75.0,
-                            sharpness_score=75, noise_score=75, detail_score=75, defect_score=75),
+                            exposure_score=75, sharpness_score=75, noise_score=75, detail_score=75, defect_score=75),
             ],
             total_scored=3,
             total_failed=0,
@@ -244,12 +348,9 @@ class TestSelectAndUpload(unittest.TestCase):
             temp_dir=temp_dir,
         )
 
-        # Should have kept 2 files (best from AEB + single)
         self.assertEqual(result.kept_count, 2)
-        # Should have rejected 1 file (dark from AEB)
         self.assertEqual(result.rejected_count, 1)
 
-        # Cleanup
         import shutil
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
