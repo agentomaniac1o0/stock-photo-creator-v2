@@ -147,7 +147,7 @@ def select_from_aeb_group(
         return kept, decisions
 
     # Step 3: Pick best from candidates
-    best_fd, best_score = max(candidates, key=lambda x: x[1].overall_score)
+    best_fd, best_score = max(candidates, key=lambda x: (x[1].overall_score, x[1].noise_score))
     kept.append(best_fd.filepath)
     decisions.append(SelectionDecision(
         filepath=best_fd.filepath,

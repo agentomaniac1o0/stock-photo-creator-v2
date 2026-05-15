@@ -433,11 +433,13 @@ def score_image_fallback(filepath: Path) -> QualityScore:
         exposure_score = compute_exposure_score(gray)
         noise_score = compute_shadow_noise(gray)
 
-        # Sharpness: Laplacian variance
+        # Sharpness: Laplacian variance, dampened by noise
+        # High noise inflates sharpness readings, so we scale by noise_score
         laplacian_kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]])
         lap = scipy_convolve(gray, laplacian_kernel)
         lap_var = float(np.var(lap))
-        sharpness_score = min(lap_var / 5.0, 100.0)
+        raw_sharpness = min(lap_var / 5.0, 100.0)
+        sharpness_score = raw_sharpness * (noise_score / 100.0)
 
         # Detail: Local contrast
         detail_score = min(float(np.std(gray)) / 2.0, 100.0)
@@ -451,7 +453,7 @@ def score_image_fallback(filepath: Path) -> QualityScore:
             ca_score = float(np.mean(rb_diff[edge_mask]))
             defect_score = max(100.0 - (ca_score * 2), 0.0)
         else:
-            defect_score = 80.0
+            defect_score = 70.0
 
         overall_score = (
             exposure_score * 0.35 +
@@ -549,7 +551,7 @@ def score_all_images(groups: list[BracketGroup]) -> QualityScorerResult:
 
         scored_files = sorted(
             zip(group.files, group_scores),
-            key=lambda x: x[1].overall_score,
+            key=lambda x: (x[1].overall_score, x[1].noise_score),
             reverse=True
         )
 

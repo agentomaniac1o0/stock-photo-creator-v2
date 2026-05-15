@@ -183,6 +183,60 @@ class TestScoreImageFallback(unittest.TestCase):
         )
         self.assertAlmostEqual(score.overall_score, expected, places=1)
 
+    @patch('modules.quality_scorer.load_image_array')
+    def test_noise_dampens_sharpness(self, mock_load):
+        """Sharpness score should be dampened by noise level."""
+        arr = np.full((100, 100, 3), 60, dtype=np.uint8)
+        arr[40:60, 40:60, :] = 120
+        mock_load.return_value = arr
+
+        score = score_image_fallback(Path("test.CR2"))
+
+        dampened = score.sharpness_score
+        noise_factor = score.noise_score / 100.0
+        self.assertLess(dampened, 100.0 * noise_factor + 1)
+
+    @patch('modules.quality_scorer.load_image_array')
+    def test_defect_default_not_zero(self, mock_load):
+        """When no edges found, defect score should be 70, not 0."""
+        arr = np.full((100, 100, 3), 128, dtype=np.uint8)
+        mock_load.return_value = arr
+
+        score = score_image_fallback(Path("test.CR2"))
+
+        self.assertGreaterEqual(score.defect_score, 60)
+
+    @patch('modules.quality_scorer.score_image')
+    def test_tie_breaker_uses_noise_score(self, mock_score):
+        """When overall scores are equal, higher noise_score should rank first."""
+        def side_effect(filepath):
+            return QualityScore(
+                filepath=filepath,
+                overall_score=63.0,
+                exposure_score=100.0,
+                sharpness_score=42.0 if "noisy" in str(filepath) else 12.0,
+                noise_score=54.0 if "noisy" in str(filepath) else 75.0,
+                detail_score=35.0,
+                defect_score=20.0,
+                assessment="Test",
+                model_used="test",
+            )
+
+        mock_score.side_effect = side_effect
+
+        group = BracketGroup(
+            group_type=GroupType.AEB,
+            files=[
+                FileExifData(filepath=Path("noisy.CR2"), exposure_compensation=0.0),
+                FileExifData(filepath=Path("clean.CR2"), exposure_compensation=0.0),
+            ],
+            group_id=1,
+        )
+
+        result = score_all_images([group])
+
+        self.assertEqual(result.scored_groups[0].files[0].filepath, Path("clean.CR2"))
+
 
 class TestScoreAllImages(unittest.TestCase):
 
