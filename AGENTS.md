@@ -4,6 +4,8 @@
 
 Modulare, testgetriebene Neufassung der Stock Photo Pipeline.
 
+**Repo:** https://github.com/agentomaniac1o0/stock-photo-creator-v2
+
 ### Architektur
 
 Jeder Pipeline-Schritt ist ein eigenes Modul mit:
@@ -14,19 +16,19 @@ Jeder Pipeline-Schritt ist ein eigenes Modul mit:
 
 ### Modul-Übersicht
 
-| Modul | Datei | Aufgabe |
-|-------|-------|---------|
-| 01 | `modules/importer.py` | RAWs aus Nextcloud laden |
-| 02 | `modules/bracket_detector.py` | AEB vs. Burst vs. Single erkennen |
+| Modul | Datei | Aufgabe | Status |
+|-------|-------|---------|--------|
+| 01 | `modules/importer.py` | RAWs aus Nextcloud laden | ✅ |
+| 02 | `modules/bracket_detector.py` | AEB vs. Burst vs. Single erkennen | ✅ |
 | 03 | `modules/overexposure_checker.py` | Clipping prüfen, unrettbarbare löschen | ✅ |
 | 04 | `modules/exposure_aligner.py` | Belichtung angleichen (Highlights/Helligkeit) | ✅ |
-| 05 | `modules/quality_scorer.py` | KI-Qualitätsbewertung | ✅ |
+| 05 | `modules/quality_scorer.py` | KI-Qualitätsbewertung (rawpy für volles RAW) | ✅ |
 | 06 | `modules/selector.py` | Beste Bilder auswählen → `RAW/cleaned/` | ✅ |
-| 07 | `modules/raw_developer.py` | RAW → JPEG mit pp3-Profilen |
-| 08 | `modules/post_processor.py` | EXIF-Rotation, sRGB, Upscale, Straighten, Crop |
-| 09 | `modules/metadata_generator.py` | GPT Vision: Szene, Titel, Keywords |
-| 10 | `modules/metadata_writer.py` | exiftool + JSON Sidecar |
-| 11 | `modules/uploader.py` | Nextcloud WebDAV Upload |
+| 07 | `modules/raw_developer.py` | RAW → JPEG mit pp3-Profilen | ⏳ |
+| 08 | `modules/post_processor.py` | EXIF-Rotation, sRGB, Upscale, Straighten, Crop | ⏳ |
+| 09 | `modules/metadata_generator.py` | GPT Vision: Szene, Titel, Keywords | ⏳ |
+| 10 | `modules/metadata_writer.py` | exiftool + JSON Sidecar | ⏳ |
+| 11 | `modules/uploader.py` | Nextcloud WebDAV Upload | ⏳ |
 
 ### Pipeline Flow
 
@@ -42,6 +44,7 @@ Nextcloud RAW/{batch}/
     ├─→ 06_selector: Beste auswählen
     │
     └─→ Upload → Nextcloud RAW/{batch}/cleaned/ (zur Qualitätskontrolle)
+        └─→ Upload → Nextcloud RAW/{batch}/rejected/
 ```
 
 **Durchlauf 2 — Entwicklung (nach Freigabe):**
@@ -61,34 +64,39 @@ Nextcloud RAW/{batch}/cleaned/
 
 | Entscheidung | Wahl |
 |-------------|------|
-| Bracket-Erkennung | Zwei Modi: AEB (EV unterschiedlich) vs. Burst (EV gleich) |
-| Erkennungskriterium | EXIF ExposureCompensation + 0-3s Zeitfenster |
-| Belichtungskorrektur | Automatisch im ersten Durchlauf |
-| Qualitätsvergleich | KI-basierte Bewertung (GPT/Gemini Vision) |
-| Bereinigungsergebnis | Nextcloud `RAW/{batch}/cleaned/` |
+| Bracket-Erkennung | Zwei Modi: AEB (unterschiedliche ExposureTime/EV) vs. Burst (gleiche EV) |
+| Erkennungskriterium | EXIF ExposureCompensation (Fraction-Parsing) + ExposureTime + 0-3s Zeitfenster |
+| Belichtungskorrektur | Automatisch im ersten Durchlauf (rawpy für RAW, Pillow für JPEG) |
+| Qualitätsvergleich | KI-basiert (OpenAI/Gemini) mit rawpy Fallback (volles RAW-Rendering) |
+| Bereinigungsergebnis | Nextcloud `RAW/{batch}/cleaned/` + `RAW/{batch}/rejected/` |
 | Modul-Struktur | Ein Modul pro Schritt |
+| EXIF-Keys | exiftool -json gibt Keys OHNE "EXIF:" Präfix zurück |
+| CR2-Rendering | rawpy für volles RAW-Rendering (nicht PIL Thumbnail) |
 
 ### Testing
 
 ```bash
 # Alle Tests
-python3 -m unittest discover tests -v
+.venv/bin/python -m unittest discover tests -v
 
 # Einzelnes Modul
-python3 -m unittest tests.test_02_bracket_detector -v
+.venv/bin/python -m unittest tests.test_02_bracket_detector -v
 ```
 
 ### CLI Usage
 
 ```bash
 # Nextcloud mode (default)
-python3 main.py Barcelona_Trip
+.venv/bin/python3 main.py Barcelona_Trip
 
 # Mit Limit (für Testing)
-python3 main.py Barcelona_Trip --max-images 10
+.venv/bin/python3 main.py Barcelona_Trip --max-images 10
 
 # Dry run
-python3 main.py Barcelona_Trip --dry-run
+.venv/bin/python3 main.py Barcelona_Trip --dry-run
+
+# Test-Run (30 Bilder)
+.venv/bin/python3 test_run.py
 ```
 
 ### Nextcloud Verzeichnisstruktur
@@ -101,13 +109,33 @@ Nextcloud: /Photos/StockFotoCreator/
       IMG_002.CR2
       cleaned/             ← Output Durchlauf 1 (zur Qualitätskontrolle)
         IMG_002.CR2        ← Ausgewählte/korrigierte RAWs
+      rejected/            ← Abgelehnte RAWs
+      selection_report.json ← Report mit Scores
+      test_run_01/         ← Test-Run Ergebnisse
   output/                  ← Output Durchlauf 2
     {batch}_minimal/
     {batch}_medium/
     {batch}_full/
-  rejected/                ← Abgelehnte Bilder
   profiles/                ← pp3 Profile
 ```
+
+### Real-Life Test Results (2026-05-15)
+
+**Batch:** SW-England-May26-01 (30 CR2-Dateien, Canon EOS M6)
+
+| Metrik | Ergebnis |
+|--------|----------|
+| Bracket Detection | 9 AEB-Gruppen + 1 Burst-Gruppe (vorher: 30 Singles) |
+| Overexposure Check | 0 rejected (keine unrettbaren Überbelichtungen) |
+| Quality Scores (rawpy) | 34-58/100 (vorher mit PIL: 31-44) |
+| Selektion | 12 kept, 18 rejected |
+| Upload | 30/30 erfolgreich |
+
+**Bug-Fixes während Test:**
+1. EXIF-Key Bug: exiftool -json gibt Keys ohne "EXIF:" Präfix zurück
+2. Fraction-Parsing: ExposureCompensation "-1/3" → -0.33
+3. rawpy für volles CR2-Rendering statt PIL Thumbnail (160x120)
+4. ExposureTime-basierte Bracket-Erkennung wenn EV-Werte identisch
 
 ### Altes Script
 
