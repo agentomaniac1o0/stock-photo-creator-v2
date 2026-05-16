@@ -168,6 +168,38 @@ Nextcloud: /Photos/StockFotoCreator/
 | 5 | LOW | Fragile Fehlererkennung (`== 50.0`) | Prüft jetzt alle 5 Metriken auf Default-Werte |
 | 6 | LOW | Default `1/100` Exposure-Time konnte Referenz verfälschen | Fallback auf Helligkeits-Schätzung wenn EXIF fehlt |
 
+### Workflow-Analyse (2026-05-16)
+
+**Ziel:** Kalibrierung der Selection-Logik durch Analyse eines manuell kuratierten Raw Therapee-Workflows.
+
+**Methode:** `analyze_workflow.py` (NEU, getrennt vom Pipeline-Code) analysiert 4 Nextcloud-Ordner:
+- `select-pipe-proj/{batch}-untouched/` — RAWs mit Standard/neutral .pp3
+- `select-pipe-proj/{batch}-alignment/` — RAWs + manuell bearbeitete .pp3
+- `select-pipe-proj/alignment/user-select/` — User-Favoriten (RAWs + .pp3)
+- `select-pipe-proj/alignment/user-reject/` — Aussortierte (RAWs + .pp3)
+
+**Analyse-Instrumente:**
+- RAW-Metriken: `quality_scorer.compute_metrics()` (noise, sharpness, exposure, defects, detail)
+- .pp3-Differenz: `alignment.pp3 - untouched.pp3` → Helligkeit, Highlights, Schatten, Kontrast, Sättigung
+- `bracket_detector.detect_brackets()` für Gruppenbildung
+
+**.pp3 Struktur (Raw Therapee, INI-ähnlich):**
+
+| Section | Relevante Keys | Bedeutung |
+|---------|---------------|-----------|
+| `[Exposure]` | `Exposure`, `Black`, `Contrast`, `Saturation`, `HighlightCompression`, `ShadowCompression`, `Lightness` | Grundbelichtung |
+| `[Shadows/Highlights]` | `Highlights`, `Shadows` (nur wenn `Enabled=true`) | Tonwertrettung |
+| `[Local Contrast]` | `Amount` (nur wenn `Enabled=true`) | Lokaler Kontrast |
+| `[Vibrance]` | `Pastels`, `Saturated` (nur wenn `Enabled=true`) | Farbsättigung |
+| `[Sharpening]` | `Amount`, `Radius` | Nachschärfung |
+
+**Report-Format:** Klartext-Muster (z.B. "User wählt Bilder mit mehr Kontrast und weniger Rauschen") + 3-5 konkrete Dateinamen als Beispiele.
+
+**Next Steps:**
+1. User erstellt Ordner in Nextcloud: `Photos/StockFotoCreator/select-pipe-proj/SW-England-May26-01-untouched/`, `-alignment/`, `alignment/user-select/`, `alignment/user-reject/`
+2. `analyze_workflow.py` ausführen
+3. Erkenntnisse validieren → neue Thresholds in `selector.py`
+
 ### Altes Script
 
 Das alte `photo_pipeline.py` bleibt im `stock-photo-creator/` Ordner erhalten.

@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser(description="Phase 1: Full Batch Selection")
     parser.add_argument("batch", help="Batch folder name in Nextcloud RAW/")
+    parser.add_argument("--max-images", type=int, default=0,
+                        help="Limit number of images (for testing)")
     args = parser.parse_args()
 
     BATCH_NAME = args.batch
@@ -67,7 +69,7 @@ def main():
     import_result = import_raw_files(
         nc_client=nc_client,
         batch_name=BATCH_NAME,
-        max_images=0,
+        max_images=args.max_images,
     )
 
     if import_result.file_count == 0:

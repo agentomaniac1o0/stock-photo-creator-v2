@@ -16,6 +16,7 @@ Input:  List of BracketGroup objects (after overexposure check)
 Output: Same groups with corrected images (in-place or new files)
 """
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -184,8 +185,11 @@ def correct_exposure_rawpy(
         return False
 
 
-def _parse_exposure_time(exp_str: str) -> float:
-    """Parse exposure time string to float seconds."""
+def _parse_exposure_time(exp_value) -> float:
+    """Parse exposure time to float seconds."""
+    if isinstance(exp_value, (int, float)):
+        return float(exp_value)
+    exp_str = str(exp_value)
     if "/" in exp_str:
         parts = exp_str.split("/")
         return float(parts[0]) / float(parts[1])
@@ -227,21 +231,28 @@ def select_reference_image(files: list[FileExifData]) -> FileExifData:
 
 def calculate_correction_params(
     file_data: FileExifData,
-    target_ev: float = 0.0,
+    reference_fd: FileExifData,
 ) -> ExposureCorrection:
     """
-    Calculate correction parameters to align an image to target exposure.
+    Calculate correction parameters to align an image to reference exposure.
+
+    Uses actual ExposureTime ratio instead of ExposureCompensation,
+    since AEB groups have identical ExposureCompensation but different
+    ExposureTime across the bracket.
 
     Args:
         file_data: EXIF data of the image to correct
-        target_ev: Target exposure value
+        reference_fd: EXIF data of the reference image
 
     Returns:
         ExposureCorrection with calculated parameters
     """
-    ev_diff = target_ev - file_data.exposure_compensation
+    t_ref = _parse_exposure_time(reference_fd.exposure_time)
+    t_cur = _parse_exposure_time(file_data.exposure_time)
+    brightness_factor = t_ref / t_cur
 
-    brightness_factor = 2.0 ** ev_diff
+    ev_diff = math.log2(brightness_factor)
+    target_ev = reference_fd.exposure_compensation
 
     if ev_diff > 0:
         highlights_adjustment = min(ev_diff * 30, 100)
@@ -287,11 +298,10 @@ def apply_correction(
     }
 
     if is_raw:
-        ev_diff = correction.target_ev - correction.original_ev
         success = correct_exposure_rawpy(
             correction.filepath,
             corrected_path,
-            brightness_adjustment=ev_diff,
+            brightness_adjustment=correction.brightness_adjustment,
         )
         if not success:
             success = correct_exposure_pillow(
@@ -369,7 +379,24 @@ def align_exposures(
                 corrected_files.append(fd)
                 continue
 
-            correction = calculate_correction_params(fd, target_ev)
+            correction = calculate_correction_params(fd, reference_fd)
+
+            if 0.95 < correction.brightness_adjustment < 1.05:
+                corrections.append(ExposureCorrection(
+                    filepath=fd.filepath,
+                    original_ev=fd.exposure_compensation,
+                    target_ev=target_ev,
+                    brightness_adjustment=1.0,
+                    highlights_adjustment=0,
+                    shadows_adjustment=0,
+                    success=True,
+                    reason="No correction needed (exposure matches reference)",
+                ))
+                corrected_files.append(fd)
+                total_corrected += 1
+                logger.info(f"  {fd.filename}: exposure matches reference, keeping original")
+                continue
+
             correction = apply_correction(correction, output_dir)
             corrections.append(correction)
 
@@ -387,7 +414,7 @@ def align_exposures(
                 )
                 corrected_files.append(corrected_fd)
                 logger.info(f"  Corrected {fd.filename}: "
-                           f"EV {fd.exposure_compensation:+.2f} → {target_ev:+.2f}")
+                           f"bright x{correction.brightness_adjustment:.2f}")
             else:
                 total_failed += 1
                 corrected_files.append(fd)
