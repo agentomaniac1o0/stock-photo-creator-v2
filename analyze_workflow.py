@@ -1,30 +1,18 @@
 """
-Analyze Workflow — Manuellen Raw Therapee-Workflow analysieren.
+Analyze Workflow — Manuellen Raw Therapee-Workflow pro Gruppe analysieren.
 
-Zweck:
-  Die Auswahl-Logik des Selectors (modules/selector.py) soll anhand eines
-  manuell kuratierten Workflows kalibriert werden. Dieses Script analysiert
-  die Unterschiede zwischen:
-    - untouched/  : RAWs mit Standard/neutral .pp3
-    - alignment/  : RAWs + manuell bearbeitete .pp3
-    - user-select/: Favoriten des Users
-    - user-reject/: Aussortierte des Users
-
-  Ausgabe: Klartext-Muster mit 3-5 konkreten Bildbeispielen – KEINE Zahlenstatistiken.
-
-Design:
-  - 0% Pipeline-Selection-Code (selector.py wird NICHT importiert)
-  - Importiert nur Rechenmodule: bracket_detector, quality_scorer
-  - .pp3-Differenz wird per configparser direkt verglichen
+Vergleicht Select vs. Reject innerhalb jeder Bracket-Gruppe.
+Alle Metriken werden vorab einmal berechnet und gecached.
 
 Usage:
   .venv/bin/python3 analyze_workflow.py --batch SW-England-May26-01
-  .venv/bin/python3 analyze_workflow.py --batch SW-England-May26-01 --local --dry-run
+  .venv/bin/python3 analyze_workflow.py --batch SW-England-May26-01 --local
 """
 import argparse
 import configparser
 import logging
 import shutil
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -36,430 +24,396 @@ logger = logging.getLogger(__name__)
 
 NC_PROJ_PATH = "Photos/StockFotoCreator/select-pipe-proj"
 LOCAL_TEMP = Path.home() / "stock-pipeline-temp-v2" / "workflow-analysis"
+RAW_EXTS = {".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2"}
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Analysiere einen manuellen Raw Therapee-Workflow"
-    )
-    parser.add_argument(
-        "--batch",
-        default="SW-England-May26-01",
-        help="Batch-Name (entspricht Nextcloud-Ordnernamen, default: SW-England-May26-01)",
-    )
-    parser.add_argument(
-        "--local",
-        action="store_true",
-        help="Lokales Temp-Dir nutzen (kein Nextcloud-Download)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Nur zeigen was analysiert würde (ohne Download/Berechnung)",
-    )
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Analysiere Workflow pro Gruppe")
+    p.add_argument("--batch", default="SW-England-May26-01")
+    p.add_argument("--local", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    return p.parse_args()
 
 
-def download_folder(nc: NextcloudClient, remote_path: str, local_dir: Path) -> int:
-    """Download all RAW + pp3 files from a Nextcloud folder to local dir.
-    Returns count of files downloaded."""
-    items = nc.list_dir(remote_path)
+def download_folder(nc, remote, local):
+    items = nc.list_dir(remote)
     if not items:
-        logger.warning(f"Leerer oder nicht gefundener Ordner: {remote_path}")
         return 0
-
-    count = 0
+    c = 0
     for item in items:
         name = item["name"]
         if name.startswith("."):
             continue
-        remote_file = f"{remote_path}/{name}"
-        local_file = local_dir / name
-        if nc.download_file(remote_file, local_file):
-            count += 1
-            logger.debug(f"  Downloaded {name}")
-        else:
-            logger.warning(f"  Download fehlgeschlagen: {name}")
-    return count
+        if nc.download_file(f"{remote}/{name}", local / name):
+            c += 1
+    return c
 
 
-def gather_local_files(directory: Path) -> list[Path]:
-    """Return all RAW + .pp3 files in a directory (non-recursive)."""
-    if not directory.exists():
-        return []
-    result = []
-    for f in sorted(directory.iterdir()):
-        if f.is_file() and not f.name.startswith("."):
-            result.append(f)
-    return result
-
-
-def parse_pp3(filepath: Path) -> dict[str, dict[str, str]]:
-    """Parse a .pp3 file into {section: {key: value}}."""
-    result = {}
+def parse_pp3(filepath):
     if not filepath.exists() or filepath.suffix.lower() != ".pp3":
-        return result
-
-    config = configparser.ConfigParser()
+        return {}
+    cfg = configparser.ConfigParser()
     try:
-        config.read(str(filepath))
+        cfg.read(str(filepath))
     except Exception:
-        logger.warning(f"Konnte .pp3 nicht parsen: {filepath.name}")
-        return result
-
-    for section in config.sections():
-        result[section] = {}
-        for key in config[section]:
-            result[section][key] = config[section][key]
+        return {}
+    result = {}
+    for s in cfg.sections():
+        result[s] = dict(cfg[s])
     return result
 
 
-def pp3_diff(
-    alignment_pp3: dict, untouched_pp3: dict
-) -> dict[str, dict[str, float]]:
-    """Compare alignment vs untouched .pp3, return numeric diffs.
+NOISE_KEYS = {
+    "darkframe", "flatfieldfile", "exifkeys", "scale",
+    "refoutput", "camerafocallength",
+}
 
-    Only returns sections/keys that actually differ.
+NOISE_CATEGORIES = {
+    "Crop", "Perspective", "Resize", "MetaData", "RAW",
+    "EPD", "Common Properties for Transformations",
+    "Version", "General",
+}
+
+
+def pp3_diff(align, untouch):
+    """Compare two .pp3 dicts, return only meaningful user edits.
+
+    Returns: {section: {key: {"align": val, "untouch": val}}}
     """
     diff = {}
 
-    relevant_sections = {
-        "Exposure": ["Exposure", "Black", "Contrast", "Saturation",
-                      "HighlightCompression", "ShadowCompression", "Lightness"],
-        "Shadows/Highlights": ["Highlights", "Shadows"],
-        "Local Contrast": ["Amount"],
-        "Vibrance": ["Pastels", "Saturated"],
-        "Sharpening": ["Amount", "Radius"],
+    relevant = {
+        "Exposure": [
+            "brightness", "contrast", "saturation", "black",
+            "highlightcompr", "highlightcomprthreshold",
+            "shadowcompr", "shadowcomprthreshold",
+            "auto", "clip", "compensation",
+            "histogrammatching", "curvefromhistogrammatching",
+            "curve", "curvemode", "curvemode2",
+        ],
+        "Color appearance": [
+            "algorithm", "detailrecovery", "artifactfiltersetting",
+            "enhancement",
+        ],
+        "Directional Pyramid Denoising": ["methodmed"],
+        "Shadows & Highlights": [
+            "enabled", "highlights", "shadows",
+            "highlighttoningwidth", "shadowtoningwidth",
+        ],
+        "PostDemosaicSharpening": [
+            "enabled", "amount", "radius", "contrast",
+            "deconvradius", "threshold", "method",
+        ],
+        "Color Management": [
+            "inputprofile", "will", "temperature", "tint",
+            "workingprofile",
+        ],
+        "Wavelet": [
+            "enabled", "chromamethod", "mixmethod",
+            "luminancemethod",
+        ],
+        "HLRecovery": ["enabled", "method"],
+        "Local Contrast": ["enabled", "amount", "radius"],
+        "Vibrance": ["enabled", "pastels", "saturated"],
+        "Tone Curve 1": ["enabled", "curve"],
+        "Tone Curve 2": ["enabled", "curve"],
+        "Film Negative": ["enabled", "colorring", "colorringlimit"],
     }
-
-    for section, keys in relevant_sections.items():
-        s_align = alignment_pp3.get(section, {})
-        s_untouch = untouched_pp3.get(section, {})
-
-        section_diffs = {}
-        for key in keys:
-            val_a = s_align.get(key, "0")
-            val_u = s_untouch.get(key, "0")
-            try:
-                diff_val = float(val_a) - float(val_u)
-            except (ValueError, TypeError):
+    for section, keys in relevant.items():
+        sa = align.get(section, {})
+        su = untouch.get(section, {})
+        sd = {}
+        for k in keys:
+            va = sa.get(k)
+            vu = su.get(k)
+            if va == vu:
                 continue
-            if abs(diff_val) > 0.001:
-                section_diffs[key] = round(diff_val, 3)
+            if va is None and vu is None:
+                continue
+            sd[k] = {"align": va, "untouch": vu}
+        if sd:
+            diff[section] = sd
 
-        if section_diffs:
-            diff[section] = section_diffs
-
-    # Also check if a feature was enabled/disabled
-    for section in ["Shadows/Highlights", "Local Contrast", "Vibrance"]:
-        enabled_a = alignment_pp3.get(section, {}).get("Enabled", "false")
-        enabled_u = untouched_pp3.get(section, {}).get("Enabled", "false")
-        if enabled_a != enabled_u:
-            if section not in diff:
-                diff[section] = {}
-            diff[section]["Enabled"] = enabled_a
+    # Also catch anything else that differs and is meaningful
+    all_sections = set(align.keys()) | set(untouch.keys())
+    for section in all_sections - set(relevant.keys()):
+        if section in NOISE_CATEGORIES:
+            continue
+        sa = align.get(section, {})
+        su = untouch.get(section, {})
+        sd = {}
+        for k in set(sa.keys()) | set(su.keys()):
+            if k.lower() in NOISE_KEYS:
+                continue
+            va = sa.get(k)
+            vu = su.get(k)
+            if va == vu:
+                continue
+            sd[k] = {"align": va, "untouch": vu}
+        if sd:
+            diff[section] = sd
 
     return diff
 
 
-def read_pp3_for_raw(raw_path: Path, pp3_dir: Path) -> dict:
-    """Try to find and parse a .pp3 sidecar for a RAW file."""
-    pp3_path = pp3_dir / f"{raw_path.stem}.pp3"
-    if pp3_path.exists():
-        return parse_pp3(pp3_path)
-    return {}
-
-
-def describe_pp3_diff(diff: dict) -> str:
-    """Human-readable description of pp3 changes."""
+def describe_pp3_diff(diff):
     if not diff:
-        return "keine nennenswerten Änderungen"
-
+        return "-"
     parts = []
     for section, keys in diff.items():
-        for key, val in keys.items():
+        for key, kv in keys.items():
+            va = str(kv.get("align", ""))
+            vu = str(kv.get("untouch", ""))
             if key == "Enabled":
-                parts.append(f"{section}: {'aktiviert' if val == 'true' else 'deaktiviert'}")
+                parts.append(f"{section}:{'ON' if va=='true' else 'OFF'}")
                 continue
-            direction = "erhöht" if val > 0 else "verringert"
-            parts.append(f"{section}/{key} {direction} um {abs(val)}")
+            # Try numeric diff
+            try:
+                dv = float(va) - float(vu)
+                d = "↑" if dv > 0 else "↓"
+                parts.append(f"{section}.{key}{d}{abs(dv):.1f}")
+            except (ValueError, TypeError):
+                parts.append(f"{section}.{key}: {vu}→{va}")
     return ", ".join(parts)
 
 
-def compute_metrics_safe(filepath: Path) -> Optional[ImageMetrics]:
-    """Compute metrics, returning None on failure."""
+def compute_metrics_safe(fp):
     try:
-        return compute_metrics(filepath)
+        return compute_metrics(fp)
     except Exception as e:
-        logger.warning(f"Metrik-Fehler für {filepath.name}: {e}")
+        logger.warning(f"Metrik-Fehler {fp.name}: {e}")
         return None
 
 
-def analyze_patterns(
-    select_dir: Path,
-    reject_dir: Path,
-    alignment_pp3_dir: Path,
+def load_metrics_cache(cache_path: Path) -> dict[str, ImageMetrics]:
+    """Load cached metrics from JSON."""
+    if not cache_path.exists():
+        return {}
+    import json
+    try:
+        with open(cache_path) as f:
+            data = json.load(f)
+        result = {}
+        for stem, vals in data.items():
+            result[stem] = ImageMetrics(
+                filepath=Path(vals.get("filepath", "")),
+                exposure_score=vals.get("exposure_score", 50),
+                noise_score=vals.get("noise_score", 50),
+                sharpness_score=vals.get("sharpness_score", 50),
+                detail_score=vals.get("detail_score", 50),
+                defect_score=vals.get("defect_score", 50),
+            )
+        return result
+    except Exception:
+        return {}
+
+
+def save_metrics_cache(cache_path: Path, metrics: dict[str, ImageMetrics]):
+    """Save metrics cache to JSON."""
+    import json
+    data = {}
+    for stem, m in metrics.items():
+        data[stem] = m.to_dict()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def precompute_all(
+    alignment_dir: Path,
     untouched_pp3_dir: Path,
-):
-    """Core analysis: compare select vs reject patterns.
+    alignment_pp3_dir: Path,
+    cache_path: Path = None,
+) -> tuple[dict[str, ImageMetrics], dict[str, str]]:
+    """Precompute metrics and pp3 diffs for all alignment RAWs."""
+    raws = sorted(p for p in alignment_dir.iterdir() if p.suffix.lower() in RAW_EXTS)
+    n = len(raws)
 
-    Does NOT import any pipeline selection code.
-    """
-    select_raws = sorted(
-        p for p in select_dir.iterdir() if p.suffix.lower() in (".cr2", ".cr3")
-    )
-    reject_raws = sorted(
-        p for p in reject_dir.iterdir() if p.suffix.lower() in (".cr2", ".cr3")
-    )
+    # Load cached metrics if available
+    metrics_cache = {}
+    if cache_path:
+        metrics_cache = load_metrics_cache(cache_path)
 
-    if not select_raws and not reject_raws:
-        logger.warning("Keine RAW-Dateien in select oder reject gefunden")
-        return
-
-    logger.info(f"Select: {len(select_raws)} RAWs, Reject: {len(reject_raws)} RAWs")
-
-    # ── Phase 1: RAW-Metriken ────────────────────────────────────────────
-    select_metrics: list[tuple[Path, ImageMetrics]] = []
-    reject_metrics: list[tuple[Path, ImageMetrics]] = []
-
-    for raw in select_raws:
-        m = compute_metrics_safe(raw)
-        if m:
-            select_metrics.append((raw, m))
-
-    for raw in reject_raws:
-        m = compute_metrics_safe(raw)
-        if m:
-            reject_metrics.append((raw, m))
-
-    if not select_metrics:
-        logger.warning("Keine gültigen Metriken für Select-Bilder")
-    if not reject_metrics:
-        logger.warning("Keine gültigen Metriken für Reject-Bilder")
-
-    # ── Phase 2: .pp3-Differenzen ────────────────────────────────────────
-    select_pp3_diffs: list[tuple[Path, dict]] = []
-    reject_pp3_diffs: list[tuple[Path, dict]] = []
-
-    for raw, _ in select_metrics:
-        alignment_pp3 = read_pp3_for_raw(raw, alignment_pp3_dir)
-        untouched_pp3 = read_pp3_for_raw(raw, untouched_pp3_dir)
-        diff = pp3_diff(alignment_pp3, untouched_pp3)
-        select_pp3_diffs.append((raw, diff))
-
-    for raw, _ in reject_metrics:
-        alignment_pp3 = read_pp3_for_raw(raw, alignment_pp3_dir)
-        untouched_pp3 = read_pp3_for_raw(raw, untouched_pp3_dir)
-        diff = pp3_diff(alignment_pp3, untouched_pp3)
-        reject_pp3_diffs.append((raw, diff))
-
-    # ── Phase 3: Muster erkennen ─────────────────────────────────────────
-    print(f"\n{'='*70}")
-    print("  WORKFLOW-ANALYSE: Select vs. Reject")
-    print(f"  Batch: {select_dir.parent.parent.name}")
-    print(f"{'='*70}")
-    print(f"\nAusgewertet: {len(select_metrics)} select, {len(reject_metrics)} reject")
-
-    # Metrik-Vergleich (Durchschnitte)
-    if select_metrics and reject_metrics:
-        print(f"\n── RAW-Metrik-Durchschnitte ──")
-        metrics_keys = ["noise_score", "sharpness_score", "exposure_score",
-                        "detail_score", "defect_score"]
-        for key in metrics_keys:
-            s_vals = [getattr(m, key) for _, m in select_metrics]
-            r_vals = [getattr(m, key) for _, m in reject_metrics]
-            s_avg = sum(s_vals) / len(s_vals) if s_vals else 0
-            r_avg = sum(r_vals) / len(r_vals) if r_vals else 0
-            diff_val = s_avg - r_avg
-            direction = "besser" if diff_val > 0 else "schlechter"
-            print(f"  {key:20s}: Select={s_avg:5.1f}  Reject={r_avg:5.1f}  "
-                  f"(Select ist {abs(diff_val):.1f} Punkte {direction})")
-
-    # pp3-Differenz-Vergleich
-    if select_pp3_diffs and reject_pp3_diffs:
-        print(f"\n── .pp3-Anpassungsmuster ──")
-        print(f"  (alignment .pp3 minus untouched/Standard .pp3)")
-
-        # Aggregate which adjustments are more common in select
-        s_adj_count = {}
-        r_adj_count = {}
-        for _, diff in select_pp3_diffs:
-            for section, keys in diff.items():
-                for key in keys:
-                    k = f"{section}/{key}"
-                    s_adj_count[k] = s_adj_count.get(k, 0) + 1
-
-        for _, diff in reject_pp3_diffs:
-            for section, keys in diff.items():
-                for key in keys:
-                    k = f"{section}/{key}"
-                    r_adj_count[k] = r_adj_count.get(k, 0) + 1
-
-        all_keys = set(s_adj_count.keys()) | set(r_adj_count.keys())
-        for k in sorted(all_keys):
-            s_pct = s_adj_count.get(k, 0) / len(select_pp3_diffs) * 100
-            r_pct = r_adj_count.get(k, 0) / len(reject_pp3_diffs) * 100
-            delta = s_pct - r_pct
-            if abs(delta) > 10:  # only report meaningful differences
-                pref = "MEHR" if delta > 0 else "WENIGER"
-                print(f"  {k:30s}: Select {s_pct:5.0f}%  Reject {r_pct:5.0f}%  "
-                      f"(→ {abs(delta):.0f}% {pref} in Select)")
-
-    # ── Beispiele ─────────────────────────────────────────────────────────
-    print(f"\n── Beispielbilder ──")
-
-    if select_metrics:
-        s_sorted_noise = sorted(select_metrics, key=lambda x: x[1].noise_score, reverse=True)
-        print(f"\n  Select — beste Rauschwerte:")
-        for raw, m in s_sorted_noise[:5]:
-            diff_desc = "keine .pp3-Änderung"
-            for r, d in select_pp3_diffs:
-                if r == raw:
-                    diff_desc = describe_pp3_diff(d)
-                    break
-            print(f"    {raw.name:30s} noise={m.noise_score:.0f}  sharp={m.sharpness_score:.0f}  "
-                  f"({diff_desc})")
-
-    if reject_metrics:
-        r_sorted_noise = sorted(reject_metrics, key=lambda x: x[1].noise_score)
-        print(f"\n  Reject — schlechteste Rauschwerte:")
-        for raw, m in r_sorted_noise[:5]:
-            diff_desc = "keine .pp3-Änderung"
-            for r, d in reject_pp3_diffs:
-                if r == raw:
-                    diff_desc = describe_pp3_diff(d)
-                    break
-            print(f"    {raw.name:30s} noise={m.noise_score:.0f}  sharp={m.sharpness_score:.0f}  "
-                  f"({diff_desc})")
-
-    # ── Muster-Zusammenfassung ───────────────────────────────────────────
-    print(f"\n── Erkannte Muster ──")
-
-    # Hier sammeln wir qualitativ, ob der User systematisch bestimmte
-    # Eigenschaften bevorzugt. Keine harten Grenzwerte – das ist
-    # Interpretation, keine Metrik.
-
-    patterns = []
-
-    if select_metrics and reject_metrics:
-        avg_s_noise = sum(getattr(m, "noise_score") for _, m in select_metrics) / len(select_metrics)
-        avg_r_noise = sum(getattr(m, "noise_score") for _, m in reject_metrics) / len(reject_metrics)
-        delta_noise = avg_s_noise - avg_r_noise
-
-        avg_s_sharp = sum(getattr(m, "sharpness_score") for _, m in select_metrics) / len(select_metrics)
-        avg_r_sharp = sum(getattr(m, "sharpness_score") for _, m in reject_metrics) / len(reject_metrics)
-        delta_sharp = avg_s_sharp - avg_r_sharp
-
-        avg_s_exp = sum(getattr(m, "exposure_score") for _, m in select_metrics) / len(select_metrics)
-        avg_r_exp = sum(getattr(m, "exposure_score") for _, m in reject_metrics) / len(reject_metrics)
-        delta_exp = avg_s_exp - avg_r_exp
-
-        avg_s_def = sum(getattr(m, "defect_score") for _, m in select_metrics) / len(select_metrics)
-        avg_r_def = sum(getattr(m, "defect_score") for _, m in reject_metrics) / len(reject_metrics)
-        delta_def = avg_s_def - avg_r_def
-
-        avg_s_detail = sum(getattr(m, "detail_score") for _, m in select_metrics) / len(select_metrics)
-        avg_r_detail = sum(getattr(m, "detail_score") for _, m in reject_metrics) / len(reject_metrics)
-        delta_detail = avg_s_detail - avg_r_detail
-
-        if delta_noise > 3:
-            patterns.append(f"Rauschen: User bevorzugt Bilder mit weniger Rauschen "
-                           f"(⌀ Select {avg_s_noise:.0f} vs ⌀ Reject {avg_r_noise:.0f})")
-        elif delta_noise < -3:
-            patterns.append(f"Rauschen: User toleriert höheres Rauschen in Select-Bildern "
-                           f"(⌀ Select {avg_s_noise:.0f} vs ⌀ Reject {avg_r_noise:.0f})")
-
-        if delta_sharp > 3:
-            patterns.append(f"Schärfe: User bevorzugt schärfere Bilder "
-                           f"(⌀ Select {avg_s_sharp:.0f} vs ⌀ Reject {avg_r_sharp:.0f})")
-        elif delta_sharp < -3:
-            patterns.append(f"Schärfe: User akzeptiert auch weichere Bilder "
-                           f"(⌀ Select {avg_s_sharp:.0f} vs ⌀ Reject {avg_r_sharp:.0f})")
-
-        if delta_exp > 5:
-            patterns.append(f"Belichtung: Select-Bilder sind tendenziell besser belichtet "
-                           f"(⌀ {avg_s_exp:.0f} vs Reject ⌀ {avg_r_exp:.0f})")
-        elif delta_exp < -5:
-            patterns.append(f"Belichtung: User wählt auch schlechter belichtete Bilder "
-                           f"(vielleicht wegen Komposition)")
-
-        if delta_def > 3:
-            patterns.append(f"Fehler/CA: User bevorzugt Bilder mit weniger Linsenfehlern")
-        elif delta_def < -3:
-            patterns.append(f"Fehler/CA: User ignoriert Linsenfehler bei der Auswahl")
-
-        if delta_detail > 3:
-            patterns.append(f"Detailreichtum: User bevorzugt detailreichere Bilder")
-
-    # pp3-basierte Muster
-    if select_pp3_diffs and reject_pp3_diffs:
-        s_has_contrast = sum(
-            1 for _, d in select_pp3_diffs
-            if "Exposure" in d and "Contrast" in d["Exposure"]
-        )
-        r_has_contrast = sum(
-            1 for _, d in reject_pp3_diffs
-            if "Exposure" in d and "Contrast" in d["Exposure"]
-        )
-        s_contrast_pct = s_has_contrast / max(len(select_pp3_diffs), 1) * 100
-        r_contrast_pct = r_has_contrast / max(len(reject_pp3_diffs), 1) * 100
-        if abs(s_contrast_pct - r_contrast_pct) > 15:
-            pref = "mehr" if s_contrast_pct > r_contrast_pct else "weniger"
-            patterns.append(f"Kontrast: User wendet {pref} Kontrast-Anpassungen in Select an "
-                           f"(Select {s_contrast_pct:.0f}% vs Reject {r_contrast_pct:.0f}%)")
-
-        s_has_sh = sum(
-            1 for _, d in select_pp3_diffs
-            if "Shadows/Highlights" in d
-        )
-        r_has_sh = sum(
-            1 for _, d in reject_pp3_diffs
-            if "Shadows/Highlights" in d
-        )
-        s_sh_pct = s_has_sh / max(len(select_pp3_diffs), 1) * 100
-        r_sh_pct = r_has_sh / max(len(reject_pp3_diffs), 1) * 100
-        if abs(s_sh_pct - r_sh_pct) > 15:
-            pref = "mehr" if s_sh_pct > r_sh_pct else "weniger"
-            patterns.append(f"Tonwertrettung: User nutzt {pref} Shadows/Highlights in Select "
-                           f"(Select {s_sh_pct:.0f}% vs Reject {r_sh_pct:.0f}%)")
-
-        s_has_sat = sum(
-            1 for _, d in select_pp3_diffs
-            if "Exposure" in d and "Saturation" in d["Exposure"]
-        )
-        r_has_sat = sum(
-            1 for _, d in reject_pp3_diffs
-            if "Exposure" in d and "Saturation" in d["Exposure"]
-        )
-        s_sat_pct = s_has_sat / max(len(select_pp3_diffs), 1) * 100
-        r_sat_pct = r_has_sat / max(len(reject_pp3_diffs), 1) * 100
-        if abs(s_sat_pct - r_sat_pct) > 15:
-            pref = "mehr" if s_sat_pct > r_sat_pct else "weniger"
-            patterns.append(f"Sättigung: User passt {pref} Sättigung in Select an "
-                           f"(Select {s_sat_pct:.0f}% vs Reject {r_sat_pct:.0f}%)")
-
-        s_has_exposure = sum(
-            1 for _, d in select_pp3_diffs
-            if "Exposure" in d and "Exposure" in d["Exposure"]
-        )
-        r_has_exposure = sum(
-            1 for _, d in reject_pp3_diffs
-            if "Exposure" in d and "Exposure" in d["Exposure"]
-        )
-        s_exp_pct = s_has_exposure / max(len(select_pp3_diffs), 1) * 100
-        r_exp_pct = r_has_exposure / max(len(reject_pp3_diffs), 1) * 100
-        if abs(s_exp_pct - r_exp_pct) > 15:
-            pref = "mehr" if s_exp_pct > r_exp_pct else "weniger"
-            patterns.append(f"Helligkeit: User korrigiert {pref} die Belichtung in Select "
-                           f"(Select {s_exp_pct:.0f}% vs Reject {r_exp_pct:.0f}%)")
-
-    if patterns:
-        for p in patterns:
-            print(f"  • {p}")
+    missing = [r for r in raws if r.stem not in metrics_cache]
+    if missing:
+        print(f"\nBerechne Metriken für {len(missing)}/{n} RAWs...")
+        for i, raw in enumerate(missing, 1):
+            stem = raw.stem
+            sys.stdout.write(f"\r  [{i}/{len(missing)}] {raw.name[:35]:35s}")
+            sys.stdout.flush()
+            m = compute_metrics_safe(raw)
+            if m:
+                metrics_cache[stem] = m
+        sys.stdout.write(f"\n")
+        sys.stdout.flush()
+        if cache_path:
+            save_metrics_cache(cache_path, metrics_cache)
     else:
-        print(f"  Keine eindeutigen Muster erkannt (zu ähnlich oder zu kleine Stichprobe)")
+        print(f"\nMetriken aus Cache geladen ({len(metrics_cache)} Einträge)")
 
-    print(f"\n{'='*70}\n")
+    # pp3 diffs (fast, always recompute)
+    print(f"Berechne pp3-Diffs für {n} Bilder...")
+    pp3_cache = {}
+    for i, raw in enumerate(raws, 1):
+        sys.stdout.write(f"\r  [{i}/{n}] {raw.name[:35]:35s}")
+        sys.stdout.flush()
+        align = parse_pp3(alignment_pp3_dir / f"{raw.name}.pp3")
+        untouch = parse_pp3(untouched_pp3_dir / f"{raw.name}.pp3")
+        pp3_cache[raw.stem] = describe_pp3_diff(pp3_diff(align, untouch))
+
+    sys.stdout.write(f"\n  Fertig: {len(metrics_cache)} Metriken, {len(pp3_cache)} pp3-Diffs\n")
+    sys.stdout.flush()
+    return metrics_cache, pp3_cache
+
+
+def build_decision_map(select_dir, reject_dir):
+    mapping = {}
+    for f in select_dir.iterdir():
+        if f.suffix.lower() in RAW_EXTS:
+            mapping[f.stem] = "select"
+    for f in reject_dir.iterdir():
+        if f.suffix.lower() in RAW_EXTS:
+            mapping[f.stem] = "reject"
+    return mapping
+
+
+def ms(m):
+    return (f"n={m.noise_score:.0f} s={m.sharpness_score:.0f} "
+            f"e={m.exposure_score:.0f} d={m.detail_score:.0f} "
+            f"df={m.defect_score:.0f}")
+
+
+def analyze_groups(
+    groups: list[BracketGroup],
+    decision_map: dict[str, str],
+    metrics_cache: dict[str, ImageMetrics],
+    pp3_cache: dict[str, str],
+) -> list[str]:
+    all_lines = []
+
+    for group in groups:
+        gtype = group.group_type.value.upper()
+        all_lines.append(f"\n── Gruppe #{group.group_id} [{gtype}] ({group.file_count} Dateien) ──")
+
+        # Classify files
+        sel = []
+        rej = []
+        unk = []
+        for fd in group.files:
+            v = decision_map.get(fd.filepath.stem, "unknown")
+            if v == "select":
+                sel.append(fd)
+            elif v == "reject":
+                rej.append(fd)
+            else:
+                unk.append(fd)
+
+        if unk:
+            all_lines.append(f"  ⚠ Unklassifiziert: {', '.join(f.filename for f in unk)}")
+
+        if not sel and not rej:
+            all_lines.append(f"  ⏭ Keine klassifizierten Dateien")
+            continue
+
+        # ─── Type A: at least 1 select ───
+        if sel:
+            all_lines.append(f"  ✅ SELECT: {', '.join(f.filename for f in sel)}")
+            for sf in sel:
+                m = metrics_cache.get(sf.filepath.stem)
+                pp = pp3_cache.get(sf.filepath.stem, "N/A")
+                all_lines.append(f"     📊 {sf.filepath.stem}: {ms(m) if m else 'N/A'}")
+                all_lines.append(f"     📝 pp3: {pp}")
+
+            if rej:
+                all_lines.append(f"  ❌ REJECT: {', '.join(f.filename for f in rej)}")
+                for rf in rej:
+                    m = metrics_cache.get(rf.filepath.stem)
+                    pp = pp3_cache.get(rf.filepath.stem, "N/A")
+                    all_lines.append(f"     📊 {rf.filepath.stem}: {ms(m) if m else 'N/A'}")
+                    all_lines.append(f"     📝 pp3: {pp}")
+
+                # Compare
+                all_lines.append(f"  🔍 Vergleich:")
+                diffs = {}
+                for attr, label in [("noise_score", "Noise"), ("sharpness_score", "Sharp"),
+                                     ("exposure_score", "Exposure"), ("defect_score", "Defects"),
+                                     ("detail_score", "Detail")]:
+                    sv = [getattr(metrics_cache[sf.filepath.stem], attr) for sf in sel
+                          if sf.filepath.stem in metrics_cache]
+                    rv = [getattr(metrics_cache[rf.filepath.stem], attr) for rf in rej
+                          if rf.filepath.stem in metrics_cache]
+                    if sv and rv:
+                        sa = sum(sv) / len(sv)
+                        ra = sum(rv) / len(rv)
+                        d = sa - ra
+                        icon = "👍" if d > 0 else "👎"
+                        diffs[attr] = (sa, ra, d)
+                        all_lines.append(f"     {label}: S={sa:.0f} vs R={ra:.0f}  ({icon}{abs(d):.1f})")
+
+                # Interpret
+                reasons = []
+                if "noise_score" in diffs:
+                    nd = diffs["noise_score"][2]
+                    if nd > 5:
+                        reasons.append("weniger Rauschen")
+                    elif nd < -5:
+                        reasons.append("⚠ MEHR Rauschen (Himmel-Kompromiss?)")
+                if "sharpness_score" in diffs:
+                    sd = diffs["sharpness_score"][2]
+                    if sd > 5:
+                        reasons.append("schärfer")
+                    elif sd < -5:
+                        reasons.append("⚠ WENIGER scharf (Bewegungsunschärfe?)")
+                if "exposure_score" in diffs:
+                    ed = diffs["exposure_score"][2]
+                    if ed > 5:
+                        reasons.append("besser belichtet")
+                    elif ed < -5:
+                        reasons.append("schlechter belichtet (trotzdem gewählt)")
+                if "defect_score" in diffs:
+                    dd = diffs["defect_score"][2]
+                    if dd > 5:
+                        reasons.append("weniger CA/Fehler")
+
+                if reasons:
+                    all_lines.append(f"     💡 {', '.join(reasons)}")
+                else:
+                    all_lines.append(f"     💡 Keine Metrik-Unterschiede → Komposition/Augen/Himmel?")
+            else:
+                all_lines.append(f"  ℹ Keine Rejects in dieser Gruppe")
+
+        # ─── Type B: all rejected ───
+        elif rej and not sel:
+            all_lines.append(f"  ❌ ALLE REJECTED:")
+            noises = []
+            sharps = []
+            for rf in rej:
+                m = metrics_cache.get(rf.filepath.stem)
+                if m:
+                    noises.append(m.noise_score)
+                    sharps.append(m.sharpness_score)
+                    all_lines.append(f"     📊 {rf.filepath.stem}: {ms(m)}")
+                    all_lines.append(f"     📝 pp3: {pp3_cache.get(rf.filepath.stem, 'N/A')}")
+
+            reasons = []
+            if noises and all(n < 30 for n in noises):
+                reasons.append("ALLE stark verrauscht")
+            elif noises and sum(1 for n in noises if n < 30) > len(noises) / 2:
+                reasons.append("mehrheitlich verrauscht")
+            if sharps and all(s < 15 for s in sharps):
+                reasons.append("ALLE unscharf")
+            elif sharps and sum(1 for s in sharps if s < 15) > len(sharps) / 2:
+                reasons.append("mehrheitlich unscharf")
+
+            if reasons:
+                all_lines.append(f"     💡 {'; '.join(reasons)}")
+            elif noises:
+                avg_n = sum(noises) / len(noises)
+                all_lines.append(f"     💡 Tendenziell verrauscht (⌀ noise={avg_n:.0f})")
+            else:
+                all_lines.append(f"     💡 Keine offensichtlichen Metrik-Probleme → Komposition?")
+
+    return all_lines
 
 
 def main():
@@ -478,67 +432,69 @@ def main():
     local_reject = local_base / reject_dir_name
 
     if args.dry_run:
-        print(f"\n{'='*70}")
-        print(f"  DRY RUN — analyze_workflow.py")
-        print(f"{'='*70}")
-        print(f"  Batch: {batch}")
-        print(f"  Nextcloud-Pfad: {NC_PROJ_PATH}/")
-        print(f"    {untouched_dir_name}/")
-        print(f"    {alignment_dir_name}/")
-        print(f"    {select_dir_name}/")
-        print(f"    {reject_dir_name}/")
-        print(f"  Lokales Temp: {local_base}")
-        print(f"\n  Würde herunterladen, Metriken berechnen und Muster erkennen.")
-        print(f"  Keine Änderungen an Pipeline oder Selector.\n")
+        print(f"Dry Run: batch={batch}, local={local_base}")
         return
 
-    if args.local:
-        logger.info(f"Lokaler Modus: suche Dateien in {local_base}")
-    else:
+    if not args.local:
         nc = init_nextcloud()
         if not nc:
-            logger.error("Kein Nextcloud-Zugang. --local verwenden oder ~/.env prüfen.")
+            print("Kein Nextcloud-Zugang")
             return
-
         if local_base.exists():
             shutil.rmtree(local_base)
+        print("Download Nextcloud...")
+        for d in [untouched_dir_name, alignment_dir_name, select_dir_name, reject_dir_name]:
+            c = download_folder(nc, f"{NC_PROJ_PATH}/{d}", local_base / d)
+            print(f"  {d}: {c}")
+    else:
+        print(f"Lokaler Modus: {local_base}")
 
-        print(f"\nLade Workflow-Ordner aus Nextcloud...")
-        for dir_name in [untouched_dir_name, alignment_dir_name]:
-            remote = f"{NC_PROJ_PATH}/{dir_name}"
-            local = local_base / dir_name
-            count = download_folder(nc, remote, local)
-            print(f"  {dir_name}: {count} Dateien")
+    decision_map = build_decision_map(local_select, local_reject)
+    n_sel = sum(1 for v in decision_map.values() if v == "select")
+    n_rej = sum(1 for v in decision_map.values() if v == "reject")
+    print(f"\nKlassifiziert: {n_sel} select, {n_rej} reject")
 
-        # select/reject are directly in alignment/ subdir
-        for dir_name in [select_dir_name, reject_dir_name]:
-            remote = f"{NC_PROJ_PATH}/{dir_name}"
-            local = local_base / dir_name
-            count = download_folder(nc, remote, local)
-            print(f"  {dir_name}: {count} Dateien")
+    alignment_raws = sorted(p for p in local_alignment.iterdir() if p.suffix.lower() in RAW_EXTS)
+    if not alignment_raws:
+        print("Keine RAWs in alignment")
+        return
 
-    # Verify folders exist
-    for name, path in [
-        (untouched_dir_name, local_untouched),
-        (alignment_dir_name, local_alignment),
-        (select_dir_name, local_select),
-        (reject_dir_name, local_reject),
-    ]:
-        if not path.exists() or not any(path.iterdir()):
-            logger.warning(f"Ordner ist leer oder fehlt: {path}")
+    print(f"\nGruppiere {len(alignment_raws)} RAWs...")
+    groups = detect_brackets(alignment_raws)
+    print(f"{len(groups)} Gruppen")
 
-    # Run analysis
-    analyze_patterns(
-        select_dir=local_select,
-        reject_dir=local_reject,
-        alignment_pp3_dir=local_alignment,
+    # Pre-compute all metrics + pp3 diffs
+    cache_path = local_base / "metrics_cache.json"
+    metrics_cache, pp3_cache = precompute_all(
+        alignment_dir=local_alignment,
         untouched_pp3_dir=local_untouched,
+        alignment_pp3_dir=local_alignment,
+        cache_path=cache_path,
     )
+
+    # Analyze
+    print(f"\n{'='*70}")
+    print("  GRUPPEN-ANALYSE")
+    print("  User: Himmel > Rauschen | Augen offen > Schärfe | Bewegungsunschärfe OK")
+    print(f"{'='*70}")
+
+    all_lines = analyze_groups(groups, decision_map, metrics_cache, pp3_cache)
+
+    for line in all_lines:
+        print(line)
+
+    # Summary
+    n_select = sum(1 for l in all_lines if "✅ SELECT" in l and "ALL" not in l)
+    n_reject_all = sum(1 for l in all_lines if "❌ ALLE REJECTED" in l)
+    print(f"\n{'='*70}")
+    print("  ZUSAMMENFASSUNG")
+    print(f"{'='*70}")
+    print(f"  Gruppen mit Select:      {n_select}")
+    print(f"  Gruppen komplett Reject: {n_reject_all}")
+    print(f"  Gesamt:                  {len(groups)}")
+    print(f"{'='*70}\n")
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s | %(message)s",
-    )
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s | %(message)s")
     main()

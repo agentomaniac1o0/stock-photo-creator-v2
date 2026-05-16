@@ -168,37 +168,63 @@ Nextcloud: /Photos/StockFotoCreator/
 | 5 | LOW | Fragile Fehlererkennung (`== 50.0`) | Prüft jetzt alle 5 Metriken auf Default-Werte |
 | 6 | LOW | Default `1/100` Exposure-Time konnte Referenz verfälschen | Fallback auf Helligkeits-Schätzung wenn EXIF fehlt |
 
-### Workflow-Analyse (2026-05-16)
+### Workflow-Analyse (2026-05-16) — Batch 1 abgeschlossen
 
-**Ziel:** Kalibrierung der Selection-Logik durch Analyse eines manuell kuratierten Raw Therapee-Workflows.
+**Werkzeug:** `analyze_workflow.py` (NEU, 0% Pipeline-Code, getrennt vom Selector)
 
-**Methode:** `analyze_workflow.py` (NEU, getrennt vom Pipeline-Code) analysiert 4 Nextcloud-Ordner:
-- `select-pipe-proj/{batch}-untouched/` — RAWs mit Standard/neutral .pp3
-- `select-pipe-proj/{batch}-alignment/` — RAWs + manuell bearbeitete .pp3
-- `select-pipe-proj/alignment/user-select/` — User-Favoriten (RAWs + .pp3)
-- `select-pipe-proj/alignment/user-reject/` — Aussortierte (RAWs + .pp3)
+**Analyse-Prinzip:** Pro Bracket-Gruppe wird verglichen, warum Select gegenüber Reject gewählt wurde.
+Per-Gruppe statt aggregiert, mit Metrik-Vergleich + pp3-Diff in einem Durchlauf.
 
-**Analyse-Instrumente:**
-- RAW-Metriken: `quality_scorer.compute_metrics()` (noise, sharpness, exposure, defects, detail)
-- .pp3-Differenz: `alignment.pp3 - untouched.pp3` → Helligkeit, Highlights, Schatten, Kontrast, Sättigung
-- `bracket_detector.detect_brackets()` für Gruppenbildung
+**pp3-Format (echte Raw Therapee Sidecar-Struktur, `{RAW_NAME}.pp3`):**
 
-**.pp3 Struktur (Raw Therapee, INI-ähnlich):**
+| Section | Wichtige Keys | User-Edits (Batch 1) |
+|---------|--------------|---------------------|
+| `[Exposure]` | `brightness`, `contrast`, `saturation`, `black`, `histogrammatching`, `curvefromhistogrammatching` | brightness ±0..22, contrast ±0..10 |
+| `[Shadows & Highlights]` | `enabled`, `highlights`, `shadows` | bis ±100 aktiviert |
+| `[PostDemosaicSharpening]` | `contrast`, `deconvradius`, `amount`, `radius` | contrast +1..4 |
+| `[Color appearance]` | `algorithm` | No→JC (Demosaicing) |
+| `[Directional Pyramid Denoising]` | `methodmed` | none→Lonly |
+| `[Wavelet]` | `chromamethod`, `mixmethod` | without→link, mix→mix7 |
+| `[Color Management]` | `inputprofile`, `will` | (cameraICC)→(camera), def→D50 |
+| `[HLRecovery]` | `enabled`, `method` | Highlight-Recovery |
 
-| Section | Relevante Keys | Bedeutung |
-|---------|---------------|-----------|
-| `[Exposure]` | `Exposure`, `Black`, `Contrast`, `Saturation`, `HighlightCompression`, `ShadowCompression`, `Lightness` | Grundbelichtung |
-| `[Shadows/Highlights]` | `Highlights`, `Shadows` (nur wenn `Enabled=true`) | Tonwertrettung |
-| `[Local Contrast]` | `Amount` (nur wenn `Enabled=true`) | Lokaler Kontrast |
-| `[Vibrance]` | `Pastels`, `Saturated` (nur wenn `Enabled=true`) | Farbsättigung |
-| `[Sharpening]` | `Amount`, `Radius` | Nachschärfung |
+**Rausch-Keys (werden rausgefiltert):** `darkframe`, `flatfieldfile`, `exifkeys`, `scale`, `refoutput`, `camerafocallength`, Crop (auto ±1px)
 
-**Report-Format:** Klartext-Muster (z.B. "User wählt Bilder mit mehr Kontrast und weniger Rauschen") + 3-5 konkrete Dateinamen als Beispiele.
+**Analyse-Ergebnisse Batch 1 (SW-England-May26-01):**
+
+```
+60 Gruppen (50 AEB, 10 Burst) = 180 RAWs
+  → 31 Gruppen mit Select
+  → 29 Gruppen komplett Rejected
+```
+
+**Pattern 1: Rauschen schlägt Schärfe (≈60% der AEB-Selects)**
+Der User wählt die Normalbelichtung (rauschärmer) über Unterbelichtung (schärfer). Dies ist der klassische AEB-Effekt: mehr Signal = weniger Rauschen, längere Belichtung = minimal unschärfer. Der Selector sollte Noise priorisieren, aber Sharpness nicht zu hart bestrafen wenn noise > 60.
+
+**Pattern 2: Himmel-Kompromiss (Gruppe 44, IMG_1655)**
+Eindeutigster Fall: Select hat MEHR Rauschen (-11), WENIGER Schärfe (+23), SCHLECHTERE Belichtung (-37). Der User hat Schatten massiv aufgehellt (Shadows↑84). Dies bestätigt die Ansage "lieber minimal mehr Rauschen, dafür Himmel".
+
+**Pattern 3: Metrik-unentschieden (≈20% der Selects)**
+~6 Gruppen mit quasi identischen Metriken. Entscheidung fiel nach Komposition/Augen/Himmel. Der Selector kann das nicht automatisch erkennen – diese Fälle müssen als "unentscheidbar durch Metriken" markiert werden.
+
+**Pattern 4: Komplette Rejects**
+- Verrauscht (13 Gruppen): noise < 35
+- Unscharf (10 Gruppen): sharp < 15  
+- Nacht/Dunkel (6 Gruppen): exposure < 30
+
+**Auffälligkeit:** Viele Selects haben keine pp3-Änderungen ("-") – Bilder die schon gut aussahen. Fast alle Rejects haben pp3-Änderungen – der User hat versucht sie zu retten, aber es hat nicht gereicht.
+
+**Pipeline-Schlussfolgerungen:**
+1. `noise_curve()` in `selector.py` ist gut – bestätigt durch User-Verhalten
+2. `sharpness_curve()` muss angepasst werden: sharp < 15 → reject (bestätigt), aber sharp zwischen 15-25 sollte nicht zu hart bestraft werden wenn noise gut ist
+3. Composition/eyes/sky entscheiden bei Metrik-Gleichstand – kann der Selector nicht lösen
+4. pp3-Diffs in der Analyse sind ein starkes Signal: "viele Edits bei Reject = User hat versucht zu retten"
 
 **Next Steps:**
-1. User erstellt Ordner in Nextcloud: `Photos/StockFotoCreator/select-pipe-proj/SW-England-May26-01-untouched/`, `-alignment/`, `alignment/user-select/`, `alignment/user-reject/`
-2. `analyze_workflow.py` ausführen
-3. Erkenntnisse validieren → neue Thresholds in `selector.py`
+1. User bereitet Batch 2 vor (gleiches Prinzip: untouched, alignment, user-select, user-reject)
+2. `analyze_workflow.py --batch BATCH2` ausführen
+3. Thresholds über beide Batches kalibrieren
+4. Änderungen in `selector.py` einfliessen lassen
 
 ### Altes Script
 
