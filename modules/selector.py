@@ -1,24 +1,17 @@
 """
-Module 06: Selector + Upload
+Module 06: Selector + Upload (v2 — Multi-Stage Filter Pipeline)
 
-Selects the best images from scored groups and uploads them to Nextcloud.
+Multi-stage selection pipeline:
+1. HARD FILTERS: Reject too-blurry (sharp < 10) and unrecoverable overexposed
+2. EXPOSURE ALIGN: All AEB images aligned to reference (done in exposure_aligner)
+3. COMPARE & SELECT:
+   - AEB groups: 1 image wins (least noise + fewest defects)
+   - Burst normal: 1 image wins (least noise + fewest defects)
+   - Burst action (ExpTime < 1/250s): keep all that pass filters
+   - Singles: keep if not too blurry + moderate noise
+4. UPLOAD: selected → Nextcloud, rejected → Nextcloud
 
-Selection logic:
-- AEB groups: Exposure gate first (reject underexposed/noisy), then keep best quality
-- Burst groups: Keep all images above quality threshold
-- Singles: Keep if score meets minimum threshold
-
-Exposure gate:
-- exposure_score < 25 → reject (severely underexposed)
-- noise_score < 30 → reject (too much shadow noise)
-- If ALL images in a group fail the gate → reject ALL (quality over quantity)
-
-Uploads:
-- Selected images → Nextcloud RAW/{batch}/selected/
-- Rejected images → Nextcloud RAW/{batch}/rejected/
-- Summary report → Nextcloud RAW/{batch}/selection_report.json
-
-Input:  List of scored BracketGroup objects
+Input:  BracketGroup objects with ImageMetrics attached
 Output: Uploaded files + selection report
 """
 import json
@@ -32,28 +25,29 @@ from typing import Optional
 from config.settings import NC_RAW_PATH
 from modules.bracket_detector import BracketGroup, GroupType, FileExifData
 from modules.nextcloud_client import NextcloudClient
-from modules.quality_scorer import QualityScore, QualityScorerResult
+from modules.quality_scorer import (
+    ImageMetrics,
+    MetricsResult,
+    noise_curve,
+    sharpness_curve,
+    exposure_correction_penalty,
+)
 
 logger = logging.getLogger(__name__)
 
 # Quality thresholds
-AEB_KEEP_BEST_ONLY = True
-BURST_MIN_SCORE = 30.0
-SINGLE_MIN_SCORE = 30.0
-
-# Exposure gate thresholds
-EXPOSURE_GATE_MIN = 25.0
+SHARPNESS_GATE_MIN = 10.0
 NOISE_GATE_MIN = 30.0
+BURST_ACTION_EXP_TIME = 1/250
 
 
 @dataclass
 class SelectionDecision:
     """Selection decision for a single image."""
     filepath: Path
-    score: float
     decision: str  # "keep" or "reject"
     reason: str
-    destination: Optional[str] = None  # Nextcloud remote path
+    destination: Optional[str] = None
 
 
 @dataclass
@@ -89,35 +83,67 @@ class SelectionResult:
             lines.append("  Decisions:")
             for d in self.decisions:
                 status = "KEPT" if d.decision == "keep" else "REJECTED"
-                lines.append(f"    {d.filepath.name}: {d.score:.0f}/100 [{status}] - {d.reason}")
+                lines.append(f"    {d.filepath.name}: [{status}] - {d.reason}")
         lines.append(f"{'='*60}")
         return "\n".join(lines)
 
 
-def passes_exposure_gate(score: QualityScore) -> tuple[bool, str]:
+def passes_hard_filters(metrics: ImageMetrics) -> tuple[bool, str]:
     """
-    Check if an image passes the exposure/noise gate.
+    Step 1: Hard filters — reject too-blurry or unrecoverable images.
 
     Returns:
         (passes, reason) - reason is rejection reason if fails
     """
-    if score.exposure_score < EXPOSURE_GATE_MIN:
-        return False, f"Underexposed (exposure={score.exposure_score:.0f} < {EXPOSURE_GATE_MIN:.0f})"
-    if score.noise_score < NOISE_GATE_MIN:
-        return False, f"Noisy (noise={score.noise_score:.0f} < {NOISE_GATE_MIN:.0f})"
+    if metrics.sharpness_score < SHARPNESS_GATE_MIN:
+        return False, f"Too blurry (sharpness={metrics.sharpness_score:.0f} < {SHARPNESS_GATE_MIN:.0f})"
     return True, ""
+
+
+def compute_comparison_score(metrics: ImageMetrics) -> tuple[float, float, float]:
+    """
+    Step 3: Compute comparison score for ranking.
+
+    Primary: noise_curve (higher = less noise)
+    Secondary: defect_score (higher = fewer defects)
+    Tertiary: sharpness_curve (higher = sharper)
+
+    Returns:
+        (noise_ranked, defect_score, sharpness_ranked) for sorting
+    """
+    penalty = exposure_correction_penalty(metrics.filepath)
+    noise_ranked = noise_curve(metrics.noise_score) - penalty
+    sharpness_ranked = sharpness_curve(metrics.sharpness_score)
+    return (noise_ranked, metrics.defect_score, sharpness_ranked)
+
+
+def select_best_in_group(
+    files: list[FileExifData],
+    metrics_list: list[ImageMetrics],
+) -> tuple[FileExifData, ImageMetrics]:
+    """
+    Select the best image from a group based on noise + defects.
+
+    Returns:
+        (best_file, best_metrics)
+    """
+    paired = list(zip(files, metrics_list))
+    best_fd, best_m = max(
+        paired,
+        key=lambda x: compute_comparison_score(x[1])
+    )
+    return best_fd, best_m
 
 
 def select_from_aeb_group(
     group: BracketGroup,
-    scores: list[QualityScore],
+    metrics_list: list[ImageMetrics],
 ) -> tuple[list[Path], list[SelectionDecision]]:
     """
-    Select the best image from an AEB group.
-
-    1. Apply exposure gate: reject underexposed/noisy images
-    2. If ALL images fail the gate → reject ALL
-    3. From remaining candidates, keep the highest-scoring image
+    Select from AEB group:
+    1. Apply hard filters (sharp < 10 → reject)
+    2. From remaining, pick best by noise + defects
+    3. If all fail filters → reject all
     """
     decisions = []
     kept = []
@@ -126,101 +152,127 @@ def select_from_aeb_group(
     if not group.files:
         return kept, decisions
 
-    # Step 1: Apply exposure gate
     candidates = []
-    for fd, score in zip(group.files, scores):
-        passes, reason = passes_exposure_gate(score)
+    for fd, m in zip(group.files, metrics_list):
+        passes, reason = passes_hard_filters(m)
         if passes:
-            candidates.append((fd, score))
+            candidates.append((fd, m))
         else:
             rejected.append(fd.filepath)
             decisions.append(SelectionDecision(
                 filepath=fd.filepath,
-                score=score.overall_score,
                 decision="reject",
-                reason=f"Failed exposure gate: {reason}",
+                reason=f"Failed hard filter: {reason}",
             ))
 
-    # Step 2: If all failed, reject all
     if not candidates:
-        logger.info(f"AEB group #{group.group_id}: ALL images failed exposure gate, rejecting all")
+        logger.info(f"AEB group #{group.group_id}: ALL images failed hard filters, rejecting all")
         return kept, decisions
 
-    # Step 3: Pick best from candidates
-    best_fd, best_score = max(candidates, key=lambda x: (x[1].overall_score, x[1].noise_score))
+    best_fd, best_m = select_best_in_group(
+        [fd for fd, _ in candidates],
+        [m for _, m in candidates],
+    )
     kept.append(best_fd.filepath)
     decisions.append(SelectionDecision(
         filepath=best_fd.filepath,
-        score=best_score.overall_score,
         decision="keep",
-        reason=f"Best quality in AEB group #{group.group_id} (passed exposure gate)",
+        reason=f"Best quality in AEB group #{group.group_id} "
+               f"(noise={best_m.noise_score:.0f}, defects={best_m.defect_score:.0f})",
     ))
 
-    # Reject remaining candidates that weren't picked
-    for fd, score in candidates:
+    for fd, m in candidates:
         if fd.filepath != best_fd.filepath:
             rejected.append(fd.filepath)
             decisions.append(SelectionDecision(
                 filepath=fd.filepath,
-                score=score.overall_score,
                 decision="reject",
                 reason=f"Lower quality than best in AEB group #{group.group_id}",
             ))
 
     logger.info(f"AEB group #{group.group_id}: kept {best_fd.filename} "
-               f"(score={best_score.overall_score:.0f}), rejected {len(group.files) - len(kept)} other(s)")
+               f"(noise={best_m.noise_score:.0f}, sharp={best_m.sharpness_score:.0f}), "
+               f"rejected {len(group.files) - len(kept)} other(s)")
 
     return kept, decisions
 
 
 def select_from_burst_group(
     group: BracketGroup,
-    scores: list[QualityScore],
-    min_score: float = BURST_MIN_SCORE,
+    metrics_list: list[ImageMetrics],
 ) -> tuple[list[Path], list[SelectionDecision]]:
     """
-    Select images from a burst group.
-
-    All images above the quality threshold are kept.
-    User makes final selection later.
+    Select from burst group:
+    - Action sequence (ExpTime < 1/250s): keep all that pass hard filters
+    - Normal burst: keep best by noise + defects
     """
     decisions = []
     kept = []
     rejected = []
 
-    for fd, score in zip(group.files, scores):
-        if score.overall_score >= min_score:
-            kept.append(fd.filepath)
-            decisions.append(SelectionDecision(
-                filepath=fd.filepath,
-                score=score.overall_score,
-                decision="keep",
-                reason=f"Above quality threshold ({min_score:.0f}) in burst group #{group.group_id}",
-            ))
+    if not group.files:
+        return kept, decisions
+
+    passed = []
+    for fd, m in zip(group.files, metrics_list):
+        passes, reason = passes_hard_filters(m)
+        if passes:
+            passed.append((fd, m))
         else:
             rejected.append(fd.filepath)
             decisions.append(SelectionDecision(
                 filepath=fd.filepath,
-                score=score.overall_score,
                 decision="reject",
-                reason=f"Below quality threshold ({min_score:.0f}) in burst group #{group.group_id}",
+                reason=f"Failed hard filter: {reason}",
             ))
 
-    logger.info(f"Burst group #{group.group_id}: kept {len(kept)}, "
-               f"rejected {len(rejected)} (threshold={min_score:.0f})")
+    if not passed:
+        logger.info(f"Burst group #{group.group_id}: ALL images failed hard filters")
+        return kept, decisions
+
+    if group.is_action_sequence:
+        for fd, m in passed:
+            kept.append(fd.filepath)
+            decisions.append(SelectionDecision(
+                filepath=fd.filepath,
+                decision="keep",
+                reason=f"Action sequence — passed filters "
+                       f"(noise={m.noise_score:.0f}, sharp={m.sharpness_score:.0f})",
+            ))
+        logger.info(f"Burst group #{group.group_id} (action): kept {len(kept)}")
+    else:
+        best_fd, best_m = select_best_in_group(
+            [fd for fd, _ in passed],
+            [m for _, m in passed],
+        )
+        kept.append(best_fd.filepath)
+        decisions.append(SelectionDecision(
+            filepath=best_fd.filepath,
+            decision="keep",
+            reason=f"Best quality in burst group #{group.group_id} "
+                   f"(noise={best_m.noise_score:.0f}, defects={best_m.defect_score:.0f})",
+        ))
+
+        for fd, m in passed:
+            if fd.filepath != best_fd.filepath:
+                rejected.append(fd.filepath)
+                decisions.append(SelectionDecision(
+                    filepath=fd.filepath,
+                    decision="reject",
+                    reason=f"Lower quality than best in burst group #{group.group_id}",
+                ))
+        logger.info(f"Burst group #{group.group_id}: kept {best_fd.filename}")
 
     return kept, decisions
 
 
 def select_from_single(
     group: BracketGroup,
-    scores: list[QualityScore],
-    min_score: float = SINGLE_MIN_SCORE,
+    metrics_list: list[ImageMetrics],
 ) -> tuple[list[Path], list[SelectionDecision]]:
     """
-    Select or reject a single image.
-
-    Kept if score meets minimum threshold.
+    Select or reject a single image:
+    - Keep if passes hard filters AND noise is not too high
     """
     decisions = []
     kept = []
@@ -230,35 +282,40 @@ def select_from_single(
         return kept, decisions
 
     fd = group.files[0]
-    score = scores[0] if scores else QualityScore(
+    m = metrics_list[0] if metrics_list else ImageMetrics(
         filepath=fd.filepath,
-        overall_score=0,
-        exposure_score=0,
-        sharpness_score=0,
-        noise_score=0,
-        detail_score=0,
-        defect_score=0,
+        exposure_score=50.0,
+        noise_score=50.0,
+        sharpness_score=50.0,
+        detail_score=50.0,
+        defect_score=50.0,
     )
 
-    if score.overall_score >= min_score:
-        kept.append(fd.filepath)
-        decisions.append(SelectionDecision(
-            filepath=fd.filepath,
-            score=score.overall_score,
-            decision="keep",
-            reason=f"Above quality threshold ({min_score:.0f})",
-        ))
-    else:
+    passes, reason = passes_hard_filters(m)
+    if not passes:
         rejected.append(fd.filepath)
         decisions.append(SelectionDecision(
             filepath=fd.filepath,
-            score=score.overall_score,
             decision="reject",
-            reason=f"Below quality threshold ({min_score:.0f})",
+            reason=f"Failed hard filter: {reason}",
+        ))
+    elif m.noise_score < NOISE_GATE_MIN:
+        rejected.append(fd.filepath)
+        decisions.append(SelectionDecision(
+            filepath=fd.filepath,
+            decision="reject",
+            reason=f"Too noisy (noise={m.noise_score:.0f} < {NOISE_GATE_MIN:.0f})",
+        ))
+    else:
+        kept.append(fd.filepath)
+        decisions.append(SelectionDecision(
+            filepath=fd.filepath,
+            decision="keep",
+            reason=f"Passed filters (noise={m.noise_score:.0f}, sharp={m.sharpness_score:.0f})",
         ))
 
     logger.info(f"Single {fd.filename}: {'kept' if kept else 'rejected'} "
-               f"(score={score.overall_score:.0f}, threshold={min_score:.0f})")
+               f"(noise={m.noise_score:.0f}, sharp={m.sharpness_score:.0f})")
 
     return kept, decisions
 
@@ -313,7 +370,6 @@ def generate_selection_report(
         "decisions": [
             {
                 "filename": d.filepath.name,
-                "score": round(d.score, 1),
                 "decision": d.decision,
                 "reason": d.reason,
             }
@@ -330,23 +386,19 @@ def generate_selection_report(
 
 
 def select_and_upload(
-    quality_result: QualityScorerResult,
+    metrics_result: MetricsResult,
     nc_client: NextcloudClient,
     batch_name: str,
     temp_dir: Path,
-    burst_min_score: float = BURST_MIN_SCORE,
-    single_min_score: float = SINGLE_MIN_SCORE,
 ) -> SelectionResult:
     """
     Select best images and upload to Nextcloud.
 
     Args:
-        quality_result: Result from quality scoring
+        metrics_result: Result from metric computation
         nc_client: Nextcloud client
         batch_name: Batch folder name
         temp_dir: Local temp directory with files
-        burst_min_score: Minimum score for burst images
-        single_min_score: Minimum score for single images
 
     Returns:
         SelectionResult with decisions and upload stats
@@ -355,45 +407,37 @@ def select_and_upload(
     all_kept = []
     all_rejected = []
 
-    score_map = {}
-    for score in quality_result.scores:
-        score_map[score.filepath] = score
+    metrics_map = {}
+    for m in metrics_result.metrics:
+        metrics_map[m.filepath] = m
 
-    for group in quality_result.scored_groups:
-        group_scores = [score_map.get(fd.filepath) for fd in group.files]
-        group_scores = [s for s in group_scores if s is not None]
+    for group in metrics_result.scored_groups:
+        group_metrics = [metrics_map.get(fd.filepath) for fd in group.files]
+        group_metrics = [m for m in group_metrics if m is not None]
 
         if group.group_type == GroupType.AEB:
-            kept, decisions = select_from_aeb_group(group, group_scores)
+            kept, decisions = select_from_aeb_group(group, group_metrics)
         elif group.group_type == GroupType.BURST:
-            kept, decisions = select_from_burst_group(
-                group, group_scores, min_score=burst_min_score
-            )
+            kept, decisions = select_from_burst_group(group, group_metrics)
         else:
-            kept, decisions = select_from_single(
-                group, group_scores, min_score=single_min_score
-            )
+            kept, decisions = select_from_single(group, group_metrics)
 
         all_decisions.extend(decisions)
         all_kept.extend(kept)
         all_rejected.extend([d.filepath for d in decisions if d.decision == "reject"])
 
-    report_path = generate_selection_report(all_decisions, batch_name, temp_dir)
+    report_path = generate_selection_report(all_decisions, f"{batch_name}_phase_1", temp_dir)
 
-    # Upload kept files to selected/
-    nc_selected_dir = f"{NC_RAW_PATH}/{batch_name}/selected"
+    nc_selected_dir = f"{NC_RAW_PATH}/{batch_name}/selected-phase_1"
     upload_success, upload_failed = upload_files(all_kept, nc_client, nc_selected_dir)
 
-    # Upload rejected files to rejected/
-    nc_rejected_dir = f"{NC_RAW_PATH}/{batch_name}/rejected"
+    nc_rejected_dir = f"{NC_RAW_PATH}/{batch_name}/rejected-phase_1"
     rej_success, rej_failed = upload_files(all_rejected, nc_client, nc_rejected_dir)
     upload_success += rej_success
     upload_failed += rej_failed
 
-    # Upload report
-    nc_client.upload_file(report_path, f"{NC_RAW_PATH}/{batch_name}/selection_report.json")
+    nc_client.upload_file(report_path, f"{NC_RAW_PATH}/{batch_name}/phase_1_report.json")
 
-    # Update decisions with remote paths
     for d in all_decisions:
         if d.decision == "keep":
             d.destination = f"{nc_selected_dir}/{d.filepath.name}"

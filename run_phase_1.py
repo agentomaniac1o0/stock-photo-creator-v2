@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-Phase 1: Full Batch Processing — Selection & Cleanup
+Phase 1: Full Batch Processing — Selection & Cleanup (v2)
 
-Processes ALL RAW files in a batch, selects the best images,
-and uploads to selected-phase_1/ and rejected-phase_1/.
+Multi-stage pipeline:
+1. Import RAW files from Nextcloud
+2. Bracket Detection (AEB/Burst/Single + action flag)
+3. Overexposure Check (reject unrecoverable clipping)
+4. Exposure Alignment (all AEB images to reference)
+5. Quality Metrics (noise, sharp, defects — no overall score)
+6. Multi-Stage Selection (hard filters → compare → select)
+7. Upload to selected-phase_1/ and rejected-phase_1/
 
 Usage:
     python3 run_phase_1.py SW-England-May26-01
@@ -21,15 +27,8 @@ from modules.importer import import_raw_files
 from modules.bracket_detector import detect_brackets, print_group_summary
 from modules.overexposure_checker import check_overexposure
 from modules.exposure_aligner import align_exposures
-from modules.quality_scorer import score_all_images
-from modules.selector import (
-    select_from_aeb_group,
-    select_from_burst_group,
-    select_from_single,
-    generate_selection_report,
-    upload_files,
-    SelectionResult,
-)
+from modules.quality_scorer import compute_all_metrics
+from modules.selector import select_and_upload
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,7 +53,7 @@ def main():
     rejected_dir = f"{NC_RAW_PATH}/{BATCH_NAME}/rejected-phase_1"
 
     logger.info("=" * 60)
-    logger.info("  PHASE 1: FULL BATCH SELECTION")
+    logger.info("  PHASE 1: FULL BATCH SELECTION (v2)")
     logger.info(f"  Batch: {BATCH_NAME}")
     logger.info(f"  Selected → {selected_dir}")
     logger.info(f"  Rejected → {rejected_dir}")
@@ -68,7 +67,7 @@ def main():
     import_result = import_raw_files(
         nc_client=nc_client,
         batch_name=BATCH_NAME,
-        max_images=0,  # No limit — process all files
+        max_images=0,
     )
 
     if import_result.file_count == 0:
@@ -113,70 +112,24 @@ def main():
 
     groups = exposure_result.aligned_groups
 
-    # Step 5: Quality Scoring
+    # Step 5: Quality Metrics
     logger.info("\n" + "=" * 60)
-    logger.info("STEP 5: Quality Scoring")
+    logger.info("STEP 5: Quality Metrics")
     logger.info("=" * 60)
 
-    quality_result = score_all_images(groups)
-    print(quality_result.summary())
+    metrics_result = compute_all_metrics(groups)
+    print(metrics_result.summary())
 
-    groups = quality_result.scored_groups
-
-    # Step 6: Selection + Upload to selected-phase_1 / rejected-phase_1
+    # Step 6: Selection + Upload
     logger.info("\n" + "=" * 60)
     logger.info("STEP 6: Selection + Upload")
     logger.info("=" * 60)
 
-    all_decisions = []
-    all_kept = []
-    all_rejected = []
-
-    score_map = {s.filepath: s for s in quality_result.scores}
-
-    for group in quality_result.scored_groups:
-        group_scores = [score_map.get(fd.filepath) for fd in group.files]
-        group_scores = [s for s in group_scores if s is not None]
-
-        if group.group_type.value == "aeb":
-            kept, decisions = select_from_aeb_group(group, group_scores)
-        elif group.group_type.value == "burst":
-            kept, decisions = select_from_burst_group(group, group_scores, min_score=50.0)
-        else:
-            kept, decisions = select_from_single(group, group_scores, min_score=50.0)
-
-        all_decisions.extend(decisions)
-        all_kept.extend(kept)
-        all_rejected.extend([d.filepath for d in decisions if d.decision == "reject"])
-
-    # Generate report
-    report_path = generate_selection_report(
-        all_decisions, f"{BATCH_NAME}_phase_1", import_result.temp_dir
-    )
-
-    # Upload to selected-phase_1 / rejected-phase_1
-    upload_success, upload_failed = upload_files(all_kept, nc_client, selected_dir)
-    rej_success, rej_failed = upload_files(all_rejected, nc_client, rejected_dir)
-    upload_success += rej_success
-    upload_failed += rej_failed
-
-    # Upload report
-    nc_client.upload_file(report_path, f"{NC_RAW_PATH}/{BATCH_NAME}/phase_1_report.json")
-
-    # Update destinations
-    for d in all_decisions:
-        if d.decision == "keep":
-            d.destination = f"{selected_dir}/{d.filepath.name}"
-        else:
-            d.destination = f"{rejected_dir}/{d.filepath.name}"
-
-    result = SelectionResult(
-        decisions=all_decisions,
-        kept_files=all_kept,
-        rejected_files=all_rejected,
-        upload_success=upload_success,
-        upload_failed=upload_failed,
-        report_path=report_path,
+    result = select_and_upload(
+        metrics_result=metrics_result,
+        nc_client=nc_client,
+        batch_name=BATCH_NAME,
+        temp_dir=import_result.temp_dir,
     )
 
     print(result.summary())

@@ -53,10 +53,46 @@ class BracketGroup:
     group_type: GroupType
     files: list[FileExifData]
     group_id: int = 0
+    is_action_sequence: bool = False
 
     @property
     def file_count(self) -> int:
         return len(self.files)
+
+    def detect_action_sequence(self, threshold: float = 1/250) -> bool:
+        """
+        Detect if this is an action/motion sequence based on exposure time.
+
+        Fast shutter speeds (< 1/250s) indicate action/sports photography
+        where capturing movement is important.
+
+        Args:
+            threshold: Exposure time threshold in seconds (default: 1/250)
+
+        Returns:
+            True if this is likely an action sequence
+        """
+        if self.group_type != GroupType.BURST:
+            return False
+
+        for fd in self.files:
+            if fd.exposure_time:
+                et_str = str(fd.exposure_time)
+                if '/' in et_str:
+                    try:
+                        parts = et_str.split('/')
+                        et_val = float(parts[0]) / float(parts[1])
+                        if et_val < threshold:
+                            return True
+                    except (ValueError, ZeroDivisionError):
+                        continue
+                else:
+                    try:
+                        if float(et_str) < threshold:
+                            return True
+                    except ValueError:
+                        continue
+        return False
 
     @property
     def has_exposure_variation(self) -> bool:
@@ -266,6 +302,7 @@ def detect_brackets(filepaths: list[Path]) -> list[BracketGroup]:
                 files=group,
                 group_id=group_id
             ))
+            groups[-1].is_action_sequence = groups[-1].detect_action_sequence()
 
         group_id += 1
 

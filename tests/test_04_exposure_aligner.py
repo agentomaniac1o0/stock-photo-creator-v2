@@ -12,6 +12,7 @@ from modules.exposure_aligner import (
     estimate_image_brightness,
     calculate_correction_params,
     align_exposures,
+    select_reference_image,
 )
 
 
@@ -101,6 +102,35 @@ class TestCalculateCorrectionParams(unittest.TestCase):
         self.assertLess(correction.shadows_adjustment, 0)
 
 
+class TestSelectReferenceImage(unittest.TestCase):
+
+    def test_three_images_picks_middle_by_exposure_time(self):
+        files = [
+            FileExifData(filepath=Path("dark.CR2"), exposure_compensation=-2.0, exposure_time="1/500"),
+            FileExifData(filepath=Path("mid.CR2"), exposure_compensation=0.0, exposure_time="1/125"),
+            FileExifData(filepath=Path("bright.CR2"), exposure_compensation=2.0, exposure_time="1/30"),
+        ]
+        ref = select_reference_image(files)
+        self.assertEqual(ref.filepath, Path("mid.CR2"))
+
+    def test_two_images_falls_back_to_brightness(self):
+        files = [
+            FileExifData(filepath=Path("dark.CR2"), exposure_compensation=-1.0, exposure_time="1/250"),
+            FileExifData(filepath=Path("bright.CR2"), exposure_compensation=1.0, exposure_time="1/60"),
+        ]
+        ref = select_reference_image(files)
+        self.assertIn(ref.filepath, [Path("dark.CR2"), Path("bright.CR2")])
+
+    def test_missing_exposure_time_falls_back_to_brightness(self):
+        files = [
+            FileExifData(filepath=Path("a.CR2"), exposure_compensation=-2.0, exposure_time=None),
+            FileExifData(filepath=Path("b.CR2"), exposure_compensation=0.0, exposure_time=None),
+            FileExifData(filepath=Path("c.CR2"), exposure_compensation=2.0, exposure_time=None),
+        ]
+        ref = select_reference_image(files)
+        self.assertIn(ref.filepath, [Path("a.CR2"), Path("b.CR2"), Path("c.CR2")])
+
+
 class TestAlignExposures(unittest.TestCase):
 
     def _make_aeb_group(self, group_id=1) -> BracketGroup:
@@ -115,8 +145,8 @@ class TestAlignExposures(unittest.TestCase):
         )
 
     @patch('modules.exposure_aligner.apply_correction')
-    def test_corrects_underexposed_images(self, mock_apply):
-        """Underexposed images should be corrected."""
+    def test_corrects_all_non_reference_images(self, mock_apply):
+        """All non-reference images should be corrected."""
         mock_apply.return_value = ExposureCorrection(
             filepath=Path("dark.CR2"),
             original_ev=-2.0,
@@ -132,13 +162,8 @@ class TestAlignExposures(unittest.TestCase):
         group = self._make_aeb_group()
         result = align_exposures([group])
 
-        self.assertEqual(result.total_corrected, 1)
+        self.assertEqual(result.total_corrected, 2)
         self.assertEqual(result.total_failed, 0)
-
-        # Check that the dark image was corrected
-        correction = result.corrections[0]
-        self.assertTrue(correction.success)
-        self.assertEqual(correction.original_ev, -2.0)
 
     @patch('modules.exposure_aligner.apply_correction')
     def test_failed_correction_keeps_original(self, mock_apply):
@@ -158,7 +183,7 @@ class TestAlignExposures(unittest.TestCase):
         result = align_exposures([group])
 
         self.assertEqual(result.total_corrected, 0)
-        self.assertEqual(result.total_failed, 1)
+        self.assertEqual(result.total_failed, 2)
 
         # Group should still have all 3 files
         self.assertEqual(result.aligned_groups[0].file_count, 3)

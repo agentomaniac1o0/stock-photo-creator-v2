@@ -1,13 +1,14 @@
 """
-Module 04: Exposure Aligner
+Module 04: Exposure Aligner (v2 — Reference-Based)
 
-For AEB groups where the brightest image was rejected (unrecoverable clipping),
-the remaining darker images are corrected to match proper exposure.
+Aligns all AEB images to a reference exposure level.
 
-Correction strategy:
-- Lift shadows/highlights in underexposed images
-- Adjust brightness to match the target exposure level
-- Uses rawpy for RAW files, Pillow for JPEGs
+Reference selection:
+- 3-image AEB: middle exposure image (by exposure_time)
+- <3 images: best histogram (closest to mid-gray)
+
+All images except the reference are corrected to match the reference.
+This ensures fair comparison of noise/sharpness/defects at the same exposure.
 
 For Burst groups and Singles: no correction needed (same exposure).
 
@@ -39,6 +40,7 @@ class ExposureCorrection:
     corrected_path: Optional[Path] = None
     success: bool = False
     reason: str = ""
+    is_reference: bool = False
 
     @property
     def filename(self) -> str:
@@ -65,8 +67,11 @@ class ExposureAlignResult:
             lines.append("")
             lines.append("  Corrections applied:")
             for c in self.corrections:
+                if c.is_reference:
+                    lines.append(f"    {c.filename}: REFERENCE (no correction)")
+                    continue
                 status = "OK" if c.success else "FAILED"
-                lines.append(f"    {c.filename}: EV {c.original_ev:+.1f} → {c.target_ev:+.1f} "
+                lines.append(f"    {c.filename}: EV {c.original_ev:+.2f} → {c.target_ev:+.2f} "
                            f"[{status}]")
                 if c.reason:
                     lines.append(f"      {c.reason}")
@@ -95,7 +100,7 @@ def estimate_image_brightness(filepath: Path) -> float:
         return float(np.mean(luminance))
     except Exception as e:
         logger.error(f"Brightness estimation error for {filepath}: {e}")
-        return 128.0  # Default mid-gray
+        return 128.0
 
 
 def correct_exposure_pillow(
@@ -179,6 +184,47 @@ def correct_exposure_rawpy(
         return False
 
 
+def _parse_exposure_time(exp_str: str) -> float:
+    """Parse exposure time string to float seconds."""
+    if "/" in exp_str:
+        parts = exp_str.split("/")
+        return float(parts[0]) / float(parts[1])
+    return float(exp_str)
+
+
+def select_reference_image(files: list[FileExifData]) -> FileExifData:
+    """
+    Select the reference image for exposure alignment.
+
+    - 3-image AEB: middle exposure (by exposure_time)
+    - <3 images: best histogram (closest to mid-gray, 128)
+
+    Args:
+        files: List of FileExifData in the AEB group
+
+    Returns:
+        The reference FileExifData
+    """
+    if len(files) == 3:
+        files_with_time = [f for f in files if f.exposure_time]
+        if len(files_with_time) == 3:
+            sorted_by_time = sorted(
+                files_with_time,
+                key=lambda f: _parse_exposure_time(f.exposure_time),
+            )
+            return sorted_by_time[1]
+
+    best_fd = None
+    best_diff = float("inf")
+    for fd in files:
+        brightness = estimate_image_brightness(fd.filepath)
+        diff = abs(brightness - 128.0)
+        if diff < best_diff:
+            best_diff = diff
+            best_fd = fd
+    return best_fd or files[0]
+
+
 def calculate_correction_params(
     file_data: FileExifData,
     target_ev: float = 0.0,
@@ -188,24 +234,19 @@ def calculate_correction_params(
 
     Args:
         file_data: EXIF data of the image to correct
-        target_ev: Target exposure value (usually 0.0 = middle exposure)
+        target_ev: Target exposure value
 
     Returns:
         ExposureCorrection with calculated parameters
     """
     ev_diff = target_ev - file_data.exposure_compensation
 
-    # Brightness adjustment: each EV stop = 2x brightness
     brightness_factor = 2.0 ** ev_diff
 
-    # Highlights/shadows adjustments based on EV difference
-    # Negative EV (underexposed) → lift shadows and highlights
     if ev_diff > 0:
-        # Image is darker than target → brighten
-        highlights_adjustment = min(ev_diff * 30, 100)  # Up to +100
-        shadows_adjustment = min(ev_diff * 50, 100)     # Up to +100
+        highlights_adjustment = min(ev_diff * 30, 100)
+        shadows_adjustment = min(ev_diff * 50, 100)
     else:
-        # Image is brighter than target → darken (rare case)
         highlights_adjustment = max(ev_diff * 30, -100)
         shadows_adjustment = max(ev_diff * 50, -100)
 
@@ -236,20 +277,16 @@ def apply_correction(
     if output_dir is None:
         output_dir = correction.filepath.parent
 
-    # Create corrected filename
     stem = correction.filepath.stem
-    suffix = correction.filepath.suffix
     corrected_name = f"{stem}_exposure_corrected.jpg"
     corrected_path = output_dir / corrected_name
     correction.corrected_path = corrected_path
 
-    # Determine if RAW or JPEG
     is_raw = correction.filepath.suffix.lower() in {
         ".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2"
     }
 
     if is_raw:
-        # Try rawpy first, fallback to Pillow
         ev_diff = correction.target_ev - correction.original_ev
         success = correct_exposure_rawpy(
             correction.filepath,
@@ -263,7 +300,6 @@ def apply_correction(
                 brightness_factor=correction.brightness_adjustment,
             )
     else:
-        # JPEG → use Pillow
         success = correct_exposure_pillow(
             correction.filepath,
             corrected_path,
@@ -286,13 +322,12 @@ def align_exposures(
     output_dir: Path = None,
 ) -> ExposureAlignResult:
     """
-    Align exposures for AEB groups where the brightest image was rejected.
+    Align exposures for all AEB groups to a reference image.
 
     For each AEB group:
-    1. Find the darkest image (lowest EV)
-    2. Calculate correction to bring it closer to target EV (0.0)
-    3. Apply correction
-    4. Update the group with corrected file path
+    1. Select reference image (middle for 3-image, best histogram for <3)
+    2. Correct ALL other images to match reference exposure
+    3. Update the group with corrected file paths
 
     Burst groups and Singles are passed through unchanged.
     """
@@ -303,60 +338,61 @@ def align_exposures(
 
     for group in groups:
         if group.group_type != GroupType.AEB:
-            # Non-AEB groups pass through unchanged
             aligned_groups.append(group)
             continue
 
         if len(group.files) < 1:
             continue
 
-        # Sort by EV (darkest first)
-        sorted_files = sorted(
-            group.files,
-            key=lambda f: f.exposure_compensation,
-        )
+        reference_fd = select_reference_image(group.files)
+        logger.info(f"AEB group #{group.group_id}: reference = {reference_fd.filename} "
+                   f"(EV={reference_fd.exposure_compensation:+.2f}, "
+                   f"ExpTime={reference_fd.exposure_time})")
 
-        # Target: middle exposure (EV=0)
-        target_ev = 0.0
-
-        logger.info(f"AEB group #{group.group_id}: aligning exposures to EV={target_ev:+.1f}")
-
+        target_ev = reference_fd.exposure_compensation
         corrected_files = []
         group_had_corrections = False
 
-        for fd in sorted_files:
-            # Only correct images that are significantly underexposed
-            if fd.exposure_compensation < -0.5:
-                correction = calculate_correction_params(fd, target_ev)
-                correction = apply_correction(correction, output_dir)
-                corrections.append(correction)
-
-                if correction.success:
-                    total_corrected += 1
-                    group_had_corrections = True
-                    # Create new FileExifData with corrected path
-                    corrected_fd = FileExifData(
-                        filepath=correction.corrected_path,
-                        exposure_compensation=target_ev,
-                        timestamp=fd.timestamp,
-                        exposure_time=fd.exposure_time,
-                        f_number=fd.f_number,
-                        iso=fd.iso,
-                        model=fd.model,
-                    )
-                    corrected_files.append(corrected_fd)
-                    logger.info(f"  Corrected {fd.filename}: "
-                              f"EV {fd.exposure_compensation:+.1f} → {target_ev:+.1f}")
-                else:
-                    total_failed += 1
-                    # Keep original file even if correction failed
-                    corrected_files.append(fd)
-                    logger.warning(f"  Correction failed for {fd.filename}, keeping original")
-            else:
-                # Image is close enough to target → keep as-is
+        for fd in group.files:
+            if fd.filepath == reference_fd.filepath:
+                corrections.append(ExposureCorrection(
+                    filepath=fd.filepath,
+                    original_ev=fd.exposure_compensation,
+                    target_ev=target_ev,
+                    brightness_adjustment=1.0,
+                    highlights_adjustment=0,
+                    shadows_adjustment=0,
+                    success=True,
+                    is_reference=True,
+                    reason="Reference image (no correction needed)",
+                ))
                 corrected_files.append(fd)
+                continue
 
-        # Create updated group
+            correction = calculate_correction_params(fd, target_ev)
+            correction = apply_correction(correction, output_dir)
+            corrections.append(correction)
+
+            if correction.success:
+                total_corrected += 1
+                group_had_corrections = True
+                corrected_fd = FileExifData(
+                    filepath=correction.corrected_path,
+                    exposure_compensation=target_ev,
+                    timestamp=fd.timestamp,
+                    exposure_time=fd.exposure_time,
+                    f_number=fd.f_number,
+                    iso=fd.iso,
+                    model=fd.model,
+                )
+                corrected_files.append(corrected_fd)
+                logger.info(f"  Corrected {fd.filename}: "
+                           f"EV {fd.exposure_compensation:+.2f} → {target_ev:+.2f}")
+            else:
+                total_failed += 1
+                corrected_files.append(fd)
+                logger.warning(f"  Correction failed for {fd.filename}, keeping original")
+
         new_group = BracketGroup(
             group_type=GroupType.AEB if len(corrected_files) > 1 else GroupType.SINGLE,
             files=corrected_files,
