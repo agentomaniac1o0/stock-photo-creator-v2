@@ -179,7 +179,7 @@ Per-Gruppe statt aggregiert, mit Metrik-Vergleich + pp3-Diff in einem Durchlauf.
 
 | Section | Wichtige Keys | User-Edits (Batch 1) |
 |---------|--------------|---------------------|
-| `[Exposure]` | `brightness`, `contrast`, `saturation`, `black`, `histogrammatching`, `curvefromhistogrammatching` | brightness ±0..22, contrast ±0..10 |
+| `[Exposure]` | `brightness`, `contrast`, `saturation`, `black`, `shadowcompr`, `highlightcompr`, `histogrammatching`, `curvefromhistogrammatching` | brightness ±0..22, contrast ±0..10, shadowcompr=50 (DRC) |
 | `[Shadows & Highlights]` | `enabled`, `highlights`, `shadows` | bis ±100 aktiviert |
 | `[PostDemosaicSharpening]` | `contrast`, `deconvradius`, `amount`, `radius` | contrast +1..4 |
 | `[Color appearance]` | `algorithm` | No→JC (Demosaicing) |
@@ -214,17 +214,32 @@ Eindeutigster Fall: Select hat MEHR Rauschen (-11), WENIGER Schärfe (+23), SCHL
 
 **Auffälligkeit:** Viele Selects haben keine pp3-Änderungen ("-") – Bilder die schon gut aussahen. Fast alle Rejects haben pp3-Änderungen – der User hat versucht sie zu retten, aber es hat nicht gereicht.
 
+### Workflow-Analyse (2026-05-17) — Session 2: Batch 2 vorbereitet
+
+**Neue Erkenntnisse vom User:**
+1. **Dynamic Range Compression (DRC)**: Raw Therapee-Tool `[Exposure] → shadowcompr/highlightcompr` kann überstrahlten Himmel retten. Gelingt nicht immer. Die Analyse muss pp3-Diffs auf `shadowcompr`-Änderungen checken und als "DRC Himmel-Rettung" taggen.
+2. **Tiebreaker bei Gleichstand**: Wenn Metriken identisch sind, nimm das Bild **ohne Menschen und störende Gegenstände** im Frame. RAW-Metriken können das nicht erfassen – muss im Report als bekanntes Limit dokumentiert werden.
+
+**Batch 2 (SW-England-May26-02):**
+- Ordner in Nextcloud vorhanden: `untouched/`, `alignment/`, `user-select/`, `user-reject/`
+- Analyse läuft nicht, weil Nextcloud in Maintenance Mode (Backup-Jobs auf VM 100)
+- Script ist bereit: `analyze_workflow.py --batch SW-England-May26-02`
+- `pp3_diff` erfasst `shadowcompr`/`highlightcompr` bereits über `[Exposure]`-Section
+- Vor Analyse: Benutzer-Heuristik-Header im Script auf DRC + Komposition ergänzen
+
 **Pipeline-Schlussfolgerungen:**
 1. `noise_curve()` in `selector.py` ist gut – bestätigt durch User-Verhalten
 2. `sharpness_curve()` muss angepasst werden: sharp < 15 → reject (bestätigt), aber sharp zwischen 15-25 sollte nicht zu hart bestraft werden wenn noise gut ist
 3. Composition/eyes/sky entscheiden bei Metrik-Gleichstand – kann der Selector nicht lösen
 4. pp3-Diffs in der Analyse sind ein starkes Signal: "viele Edits bei Reject = User hat versucht zu retten"
 
-**Next Steps:**
-1. User bereitet Batch 2 vor (gleiches Prinzip: untouched, alignment, user-select, user-reject)
-2. `analyze_workflow.py --batch BATCH2` ausführen
-3. Thresholds über beide Batches kalibrieren
-4. Änderungen in `selector.py` einfliessen lassen
+**Next Steps (nächste Session):**
+1. Nextcloud Maintenance Mode deaktivieren (`sudo -u www-data php /var/www/nextcloud/occ maintenance:mode --off` auf VM 100)
+2. `analyze_workflow.py` anpassen: Heuristik-Header um DRC + Komposition/Tiebreaker ergänzen
+3. `analyze_workflow.py --batch SW-England-May26-02` ausführen
+4. Patterns mit Batch 1 cross-validieren
+5. Thresholds in `selector.py` kalibrieren
+6. AGENTS.md + Memory + commit
 
 ### Altes Script
 
