@@ -20,10 +20,11 @@ Jeder Pipeline-Schritt ist ein eigenes Modul mit:
 |-------|-------|---------|--------|
 | 01 | `modules/importer.py` | RAWs aus Nextcloud laden | ✅ |
 | 02 | `modules/bracket_detector.py` | AEB vs. Burst vs. Single erkennen | ✅ |
-| 03 | `modules/overexposure_checker.py` | Clipping prüfen, unrettbarbare löschen | ✅ |
-| 04 | `modules/exposure_aligner.py` | Belichtung angleichen (Highlights/Helligkeit) | ✅ |
-| 05 | `modules/quality_scorer.py` | KI-Qualitätsbewertung (rawpy für volles RAW) | ✅ |
-| 06 | `modules/selector.py` | Beste Bilder auswählen → `RAW/cleaned/` | ✅ |
+| 03 | `modules/exposure_aligner.py` | Belichtung angleichen (beste Tonkurve als Referenz) | ✅ |
+| 04 | `modules/sky_recovery.py` | DRC Highlight Recovery (Himmel retten via Tonkompression) | ✅ |
+| 05 | `modules/overexposure_checker.py` | Clipping prüfen (nach Alignment+DRC) | ✅ |
+| 06 | `modules/quality_scorer.py` | Qualitätsmetriken (rawpy für volles RAW) | ✅ |
+| 07 | `modules/selector.py` | Low-Light/DRC/Tie-bewusste Selektion → `RAW/cleaned/` | ✅ |
 | 07 | `modules/raw_developer.py` | RAW → JPEG mit pp3-Profilen | ⏳ |
 | 08 | `modules/post_processor.py` | EXIF-Rotation, sRGB, Upscale, Straighten, Crop | ⏳ |
 | 09 | `modules/metadata_generator.py` | GPT Vision: Szene, Titel, Keywords | ⏳ |
@@ -32,29 +33,54 @@ Jeder Pipeline-Schritt ist ein eigenes Modul mit:
 
 ### Pipeline Flow
 
-**Durchlauf 1 — Bereinigung (v3 — Multi-Stage Filter):**
+**Durchlauf 1 — Bereinigung (v3 — Analyse-getrieben, 2026-05-17):**
 ```
 Nextcloud RAW/{batch}/
     │
-    ├─→ 01_importer: Download → lokales Temp-Dir
+    ├─→ 01_importer: RAWs + Sidecars von Nextcloud laden
     ├─→ 02_bracket_detector: AEB / Burst / Single gruppieren + Action-Flag
-    ├─→ 03_overexposure_checker: Unrettbar überbelichtete löschen
-    ├─→ 04_exposure_aligner: ALLE AEB-Bilder an Referenz angleichen
-    │   └─→ 3-Bild-AEB: mittleres Bild als Referenz
-    │   └─→ <3 Bilder: bestes Histogramm als Referenz
-    ├─→ 05_quality_scorer: Metriken berechnen (kein Gesamtscore!)
+    │
+    ├─→ 03_exposure_aligner: ALLE auf beste Tonkurve angleichen
+    │   └─→ Referenz = Bild mit bester Tonkurve (histogramm-basiert:
+    │       Midton-Nähe + wenig Clipping + gute Kontrastspanne)
+    │   └─→ Alle anderen auf Referenz-Helligkeit angleichen
+    │   └─→ → {stem}_exposure_corrected.jpg
+    │
+    ├─→ 04_sky_recovery: DRC auf verbleibende Überstrahlungen
+    │   └─→ Jedes alignte Bild prüfen:
+    │       • Clipping > 2% + Highlight-Detail ≥ 0.1 → DRC versuchen
+    │       • Clipping > 2% + Highlight-Detail < 0.1 → nicht rettbar
+    │       • Clipping ≤ 2% → kein DRC nötig (natürlich gut)
+    │   └─→ → {stem}_drc.jpg (bei Erfolg)
+    │   └─→ → drc_applied/drc_success an FileExifData attachiert
+    │
+    ├─→ 05_overexposure_checker: JETZT erst prüfen (nach Align+DRC)
+    │   └─→ Unrettbare (DRC-fail + clipping) endgültig rauswerfen
+    │
+    ├─→ 06_quality_scorer: Metriken auf den finalen Bildern
     │   └─→ noise, sharpness, defects, exposure, detail einzeln
-    ├─→ 06_selector: Multi-Stage Filter-Pipeline
-    │   └─→ Schritt 1: Harte Filter (sharp < 10 → reject)
-    │   └─→ Schritt 2: Vergleich (wenigstes Rauschen + wenigste Fehler)
-    │   └─→ Schritt 3: Auswahl
-    │       └─→ AEB: 1 Bild gewinnt
-    │       └─→ Burst normal: 1 Bild gewinnt
-    │       └─→ Burst Action (ExpTime < 1/250s): alle die Filter bestehen
-    │       └─→ Singles: behalten wenn nicht zu unscharf + moderates Rauschen
+    │
+    ├─→ 07_selector: Low-Light/DRC/Tie-bewusste Selektion
+    │   └─→ Schritt 1: Low-Light erkennen (ISO>1600 | Ø exposure<40)
+    │       • Normal:   sharpness_gate = 10, noise_gate = 30
+    │       • Low-Light: sharpness_gate =  5, noise_gate = 15
+    │   └─→ Schritt 2: DRC-Fail aussortieren
+    │   └─→ Schritt 3: Harte Filter (sharpness < gate → reject)
+    │   └─→ Schritt 4: Ranking (noise_curve → defects → sharpness_curve
+    │       → exposure_score + DRC-Bonus)
+    │       • kein DRC nötig:  +10 (natürlich gute Highlights)
+    │       • DRC erfolgreich: +5  (gerettet, leichte Artefakte)
+    │       • DRC fehlgeschlagen: -20 (eh schon raus)
+    │   └─→ Schritt 5: Auswahl nach Gruppentyp
+    │       • AEB: 1 Bild gewinnt
+    │       • Burst normal: 1 Bild gewinnt
+    │       • Burst Action (ExpTime < 1/250s): alle die Filter bestehen
+    │       • Singles: noise > gate (normal 30, low-light 15)
+    │   └─→ Schritt 6: Tie-Report (Top-2 < 2% → manuelle Prüfung)
     │
     └─→ Upload → Nextcloud RAW/{batch}/selected-phase_1/
         └─→ Upload → Nextcloud RAW/{batch}/rejected-phase_1/
+        └─→ Report → phase_1_report.json (mit Tie-Flags, DRC-Status)
 ```
 
 **Durchlauf 2 — Entwicklung (nach Freigabe):**
@@ -76,14 +102,21 @@ Nextcloud RAW/{batch}/cleaned/
 |-------------|------|
 | Bracket-Erkennung | Zwei Modi: AEB (unterschiedliche ExposureTime/EV) vs. Burst (gleiche EV) |
 | Erkennungskriterium | EXIF ExposureCompensation (Fraction-Parsing) + ExposureTime + 0-3s Zeitfenster |
-| Belichtungsangleich | ALLE AEB-Bilder an Referenz (nicht nur <-0.5 EV) |
-| Referenz-Bild | 3-Bild-AEB: mittleres Bild, <3 Bilder: bestes Histogramm |
-| Qualitätsvergleich | Metrik-basiert (kein Gesamtscore): Noise primär, Defects sekundär, Sharpness Tie-Breaker |
+| Belichtungsangleich | ALLE AEB-Bilder an beste Tonkurve angleichen |
+| Referenz-Bild | Bild mit bester Tonkurve (histogramm-basiert: Midton-Nähe × Clipping-Penalty × DR-Bonus) |
+| DRC Sky Recovery | Highlight-Kompression auf RAW (rawpy) oder JPEG (Tonkurve), max. Stärke 20 |
+| Pipeline-Reihenfolge | Align → DRC → Overexposure → Metrics → Selection (analyse-getrieben) |
+| Qualitätsvergleich | 4-stufig: noise_curve → defect_score → sharpness_curve → exposure_score + DRC-Bonus |
+| DRC Bonus | kein DRC nötig: +10, DRC erfolgreich: +5, DRC fehlgeschlagen: -20 |
 | Bereinigungsergebnis | Nextcloud `RAW/{batch}/selected-phase_1/` + `RAW/{batch}/rejected-phase_1/` |
 | Modul-Struktur | Ein Modul pro Schritt |
 | EXIF-Keys | exiftool -json gibt Keys OHNE "EXIF:" Präfix zurück |
 | CR2-Rendering | rawpy für volles RAW-Rendering (nicht PIL Thumbnail) |
-| Hard Filter | sharpness < 10 → reject (zu unscharf für Nachschärfung) |
+| Hard Filter (normal) | sharpness < 10 → reject |
+| Hard Filter (low-light) | sharpness < 5 → reject (ISO>1600 oder Ø exposure<40) |
+| Noise-Gate (normal) | single noise < 30 → reject |
+| Noise-Gate (low-light) | single noise < 15 → reject |
+| Tie-Detection | Top-2 < 2% Unterschied → "manuelle Prüfung" im Report |
 | Noise-Vergleich | noise_curve() mit diminishing returns ab 70, Penalty ab 40 |
 | Sharpness-Vergleich | sharpness_curve() mit Bonus ab 35, Penalty unter 15 |
 | Exposure-Penalty | -5 Punkte für exposure-corrected Bilder (aufgehellt) |
@@ -214,32 +247,48 @@ Eindeutigster Fall: Select hat MEHR Rauschen (-11), WENIGER Schärfe (+23), SCHL
 
 **Auffälligkeit:** Viele Selects haben keine pp3-Änderungen ("-") – Bilder die schon gut aussahen. Fast alle Rejects haben pp3-Änderungen – der User hat versucht sie zu retten, aber es hat nicht gereicht.
 
-### Workflow-Analyse (2026-05-17) — Session 2: Batch 2 vorbereitet
+### Workflow-Analyse (2026-05-17) — Session 2: Batch 2 abgeschlossen
 
 **Neue Erkenntnisse vom User:**
 1. **Dynamic Range Compression (DRC)**: Raw Therapee-Tool `[Exposure] → shadowcompr/highlightcompr` kann überstrahlten Himmel retten. Gelingt nicht immer. Die Analyse muss pp3-Diffs auf `shadowcompr`-Änderungen checken und als "DRC Himmel-Rettung" taggen.
 2. **Tiebreaker bei Gleichstand**: Wenn Metriken identisch sind, nimm das Bild **ohne Menschen und störende Gegenstände** im Frame. RAW-Metriken können das nicht erfassen – muss im Report als bekanntes Limit dokumentiert werden.
+3. **Innenaufnahmen (Kirche etc.)**: Fotos mit wenig Licht fallen meistens wegen hohem Rauschen durch. Sollten aber weniger streng bewertet werden als Aussenaufnahmen – ein paar wurden trotzdem ausgewählt, weil sie von den verrauschten Kandidaten die beste Qualität hatten.
 
-**Batch 2 (SW-England-May26-02):**
-- Ordner in Nextcloud vorhanden: `untouched/`, `alignment/`, `user-select/`, `user-reject/`
-- Analyse läuft nicht, weil Nextcloud in Maintenance Mode (Backup-Jobs auf VM 100)
-- Script ist bereit: `analyze_workflow.py --batch SW-England-May26-02`
+**Batch 2 (SW-England-May26-02) — Analyse abgeschlossen:**
+```
+56 Gruppen (165 RAWs)
+  → 25 Gruppen mit Select
+  → 31 Gruppen komplett Rejected
+```
+- Muster sind konsistent zu Batch 1 (Rauschen > Schärfe, Himmel-Kompromiss)
+- `analyze_workflow.py` hat jetzt `--keep-files` Flag (default: cleanup nach Analyse)
 - `pp3_diff` erfasst `shadowcompr`/`highlightcompr` bereits über `[Exposure]`-Section
-- Vor Analyse: Benutzer-Heuristik-Header im Script auf DRC + Komposition ergänzen
 
-**Pipeline-Schlussfolgerungen:**
-1. `noise_curve()` in `selector.py` ist gut – bestätigt durch User-Verhalten
-2. `sharpness_curve()` muss angepasst werden: sharp < 15 → reject (bestätigt), aber sharp zwischen 15-25 sollte nicht zu hart bestraft werden wenn noise gut ist
-3. Composition/eyes/sky entscheiden bei Metrik-Gleichstand – kann der Selector nicht lösen
-4. pp3-Diffs in der Analyse sind ein starkes Signal: "viele Edits bei Reject = User hat versucht zu retten"
+**Pipeline-Schlussfolgerungen (alle umgesetzt in v3, 2026-05-17):**
+1. `noise_curve()` ist gut – bestätigt durch User-Verhalten ✅
+2. `sharpness_curve()` angepasst: sharp < 15 → reject, 15-25 nicht zu hart bestraft ✅
+3. **Low-Light-Detection**: ISO>1600 oder Ø exposure<40 → relaxed Gates ✅
+4. **DRC Sky Recovery**: Highlight-Kompression als Pipeline-Schritt (vor Overexposure-Check) ✅
+5. **Exposure als 4. Kriterium**: exposure_score im Ranking (nach noise → defects → sharpness) ✅
+6. **DRC-Bonus**: Kein DRC nötig +10, DRC erfolgreich +5, DRC fail -20 ✅
+7. **Tie-Report**: Top-2 < 2% → manuelle Prüfung empfohlen ✅
+8. **Pipeline-Reihenfolge**: Align → DRC → Overexposure → Metrics → Selection ✅
 
-**Next Steps (nächste Session):**
-1. Nextcloud Maintenance Mode deaktivieren (`sudo -u www-data php /var/www/nextcloud/occ maintenance:mode --off` auf VM 100)
-2. `analyze_workflow.py` anpassen: Heuristik-Header um DRC + Komposition/Tiebreaker ergänzen
-3. `analyze_workflow.py --batch SW-England-May26-02` ausführen
-4. Patterns mit Batch 1 cross-validieren
-5. Thresholds in `selector.py` kalibrieren
-6. AGENTS.md + Memory + commit
+### Live Test (2026-05-17) — Phase 1 Batch 1 (SW-England-May26-01)
+
+**Ergebnis:** 180 RAWs, 60 Gruppen (50 AEB, 10 Burst)
+- **42 Selected**, **136 Rejected**, **2 Unrecoverable** (IMG_1686, IMG_1695)
+- Upload 178/178 ✅
+- Laufzeit: ~57 min (rawpy ist der Flaschenhals)
+
+**DRC:** 72 Versuche, 0 erfolgreich — alignment-korrigierte JPEGs haben zu wenig Highlight-Detail.
+CR2-native Clipper haben ebenfalls kaum Detail (Nacht/Langzeit-Bursts).
+
+**Reject-Muster bestätigt:** AEB-Unterbelichtungen fallen durch sharpness-gate, Normalbelichtung gewinnt.
+Konsistent zur Analyse "Rauschen schlägt Schärfe".
+
+**Erkenntnis:** `NC_RAW_PATH` muss bei abweichenden Pfaden per ENV-Variable setzbar sein
+(jetzt möglich via `NC_RAW_PATH` env var in settings.py).
 
 ### Altes Script
 

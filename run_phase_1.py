@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Phase 1: Full Batch Processing — Selection & Cleanup (v2)
+Phase 1: Full Batch Processing — Selection & Cleanup (v3)
 
-Multi-stage pipeline:
+Multi-stage pipeline (analysis-driven order):
 1. Import RAW files from Nextcloud
 2. Bracket Detection (AEB/Burst/Single + action flag)
-3. Overexposure Check (reject unrecoverable clipping)
-4. Exposure Alignment (all AEB images to reference)
-5. Quality Metrics (noise, sharp, defects — no overall score)
-6. Multi-Stage Selection (hard filters → compare → select)
-7. Upload to selected-phase_1/ and rejected-phase_1/
+3. Exposure Alignment (align ALL to best-toncurve reference)
+4. DRC Sky Recovery (highlight recovery via tone compression)
+5. Overexposure Check (reject unrecoverable after alignment+DRC)
+6. Quality Metrics (noise, sharp, defects, exposure, detail)
+7. Multi-Stage Selection (hard filters → compare → low-light → tie-report)
+8. Upload to selected-phase_1/ and rejected-phase_1/
 
 Usage:
     python3 run_phase_1.py SW-England-May26-01
@@ -25,8 +26,9 @@ from config.settings import NC_RAW_PATH
 from modules.nextcloud_client import init_nextcloud
 from modules.importer import import_raw_files
 from modules.bracket_detector import detect_brackets, print_group_summary
-from modules.overexposure_checker import check_overexposure
 from modules.exposure_aligner import align_exposures
+from modules.sky_recovery import recover_highlights
+from modules.overexposure_checker import check_overexposure
 from modules.quality_scorer import compute_all_metrics
 from modules.selector import select_and_upload
 
@@ -55,7 +57,7 @@ def main():
     rejected_dir = f"{NC_RAW_PATH}/{BATCH_NAME}/rejected-phase_1"
 
     logger.info("=" * 60)
-    logger.info("  PHASE 1: FULL BATCH SELECTION (v2)")
+    logger.info("  PHASE 1: FULL BATCH SELECTION (v3)")
     logger.info(f"  Batch: {BATCH_NAME}")
     logger.info(f"  Selected → {selected_dir}")
     logger.info(f"  Rejected → {rejected_dir}")
@@ -86,9 +88,33 @@ def main():
     groups = detect_brackets(import_result.raw_files)
     print(print_group_summary(groups))
 
-    # Step 3: Overexposure Check
+    # Step 3: Exposure Alignment (align ALL to best-toncurve reference)
     logger.info("\n" + "=" * 60)
-    logger.info("STEP 3: Overexposure Check")
+    logger.info("STEP 3: Exposure Alignment (to best toncurve)")
+    logger.info("=" * 60)
+
+    exposure_result = align_exposures(
+        groups,
+        output_dir=import_result.temp_dir / "corrected",
+    )
+    print(exposure_result.summary())
+
+    groups = exposure_result.aligned_groups
+
+    # Step 4: DRC Sky Recovery (highlight recovery via tone compression)
+    logger.info("\n" + "=" * 60)
+    logger.info("STEP 4: DRC Sky Recovery")
+    logger.info("=" * 60)
+
+    sky_result = recover_highlights(
+        groups,
+        output_dir=import_result.temp_dir / "drc",
+    )
+    print(sky_result.summary())
+
+    # Step 5: Overexposure Check (now: after alignment+DRC)
+    logger.info("\n" + "=" * 60)
+    logger.info("STEP 5: Overexposure Check (after alignment + DRC)")
     logger.info("=" * 60)
 
     overexposure_result = check_overexposure(groups)
@@ -101,30 +127,17 @@ def main():
         import_result.cleanup()
         sys.exit(1)
 
-    # Step 4: Exposure Alignment
+    # Step 6: Quality Metrics
     logger.info("\n" + "=" * 60)
-    logger.info("STEP 4: Exposure Alignment")
-    logger.info("=" * 60)
-
-    exposure_result = align_exposures(
-        groups,
-        output_dir=import_result.temp_dir / "corrected",
-    )
-    print(exposure_result.summary())
-
-    groups = exposure_result.aligned_groups
-
-    # Step 5: Quality Metrics
-    logger.info("\n" + "=" * 60)
-    logger.info("STEP 5: Quality Metrics")
+    logger.info("STEP 6: Quality Metrics")
     logger.info("=" * 60)
 
     metrics_result = compute_all_metrics(groups)
     print(metrics_result.summary())
 
-    # Step 6: Selection + Upload
+    # Step 7: Selection + Upload
     logger.info("\n" + "=" * 60)
-    logger.info("STEP 6: Selection + Upload")
+    logger.info("STEP 7: Selection + Upload (low-light, DRC, tie-aware)")
     logger.info("=" * 60)
 
     result = select_and_upload(
@@ -136,7 +149,7 @@ def main():
 
     print(result.summary())
 
-    # Cleanup
+    # Step 8: Cleanup
     import_result.cleanup()
 
     logger.info("\n" + "=" * 60)

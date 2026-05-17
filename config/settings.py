@@ -11,7 +11,7 @@ NEXTCLOUD_USER = os.getenv("NEXTCLOUD_USER", "nerdclaudeadm")
 NEXTCLOUD_APP_PASSWORD = os.getenv("NEXTCLOUD_APP_PASSWORD", "")
 
 NC_BASE_PATH = "Photos/StockFotoCreator"
-NC_RAW_PATH = f"{NC_BASE_PATH}/RAW"
+NC_RAW_PATH = os.getenv("NC_RAW_PATH", f"{NC_BASE_PATH}/RAW")
 
 # ── Bracket Detection ─────────────────────────────────────────────────────────
 

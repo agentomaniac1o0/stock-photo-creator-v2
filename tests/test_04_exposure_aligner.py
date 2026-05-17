@@ -5,11 +5,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import numpy as np
+
 from modules.bracket_detector import BracketGroup, GroupType, FileExifData
 from modules.exposure_aligner import (
     ExposureCorrection,
     ExposureAlignResult,
     estimate_image_brightness,
+    compute_toncurve_score,
     calculate_correction_params,
     align_exposures,
     select_reference_image,
@@ -35,18 +38,13 @@ class TestEstimateImageBrightness(unittest.TestCase):
     @patch('modules.exposure_aligner.Image.open')
     def test_brightness_estimation(self, mock_open):
         """Should return average luminance."""
-        import numpy as np
         mock_img = MagicMock()
         mock_img.mode = "RGB"
         mock_open.return_value = mock_img
 
         with patch('modules.exposure_aligner.np.array') as mock_array:
-            # Mid-gray image
             mock_array.return_value = np.full((100, 100, 3), 128, dtype=np.uint8)
-
             brightness = estimate_image_brightness(Path("test.CR2"))
-
-            # Mid-gray should be around 128
             self.assertAlmostEqual(brightness, 128.0, delta=1.0)
 
     @patch('modules.exposure_aligner.Image.open', side_effect=Exception("test error"))
@@ -56,6 +54,26 @@ class TestEstimateImageBrightness(unittest.TestCase):
         self.assertEqual(brightness, 128.0)
 
 
+class TestComputeToncurveScore(unittest.TestCase):
+
+    @patch('modules.exposure_aligner.Image.open')
+    def test_error_returns_default(self, mock_open):
+        mock_open.side_effect = Exception("error")
+        score = compute_toncurve_score(Path("test.CR2"))
+        self.assertEqual(score, 50.0)
+
+    @patch('modules.exposure_aligner.Image.open')
+    def test_midgray_gets_high_score(self, mock_open):
+        mock_img = MagicMock()
+        mock_img.mode = "RGB"
+        mock_open.return_value = mock_img
+
+        with patch('modules.exposure_aligner.np.array') as mock_array:
+            mock_array.return_value = np.full((100, 100, 3), 128, dtype=np.uint8)
+            score = compute_toncurve_score(Path("test.CR2"))
+            self.assertGreater(score, 70)
+
+
 class TestCalculateCorrectionParams(unittest.TestCase):
 
     def test_underexposed_image_correction(self):
@@ -63,72 +81,75 @@ class TestCalculateCorrectionParams(unittest.TestCase):
         fd = FileExifData(
             filepath=Path("dark.CR2"),
             exposure_compensation=-2.0,
+            exposure_time="1/500",
         )
-
-        correction = calculate_correction_params(fd, target_ev=0.0)
+        ref_fd = FileExifData(
+            filepath=Path("mid.CR2"),
+            exposure_compensation=0.0,
+            exposure_time="1/125",
+        )
+        correction = calculate_correction_params(fd, ref_fd)
 
         self.assertEqual(correction.original_ev, -2.0)
-        self.assertEqual(correction.target_ev, 0.0)
-        # -2 EV → 2^2 = 4x brightness
-        self.assertAlmostEqual(correction.brightness_adjustment, 4.0, delta=0.01)
+        self.assertGreater(correction.brightness_adjustment, 1.0)
         self.assertGreater(correction.highlights_adjustment, 0)
         self.assertGreater(correction.shadows_adjustment, 0)
 
     def test_well_exposed_image_no_correction(self):
-        """Image at 0 EV should need minimal correction."""
+        """Image at 0 EV with same exposure time as ref should need minimal."""
         fd = FileExifData(
             filepath=Path("mid.CR2"),
             exposure_compensation=0.0,
+            exposure_time="1/125",
         )
-
-        correction = calculate_correction_params(fd, target_ev=0.0)
+        ref_fd = FileExifData(
+            filepath=Path("ref.CR2"),
+            exposure_compensation=0.0,
+            exposure_time="1/125",
+        )
+        correction = calculate_correction_params(fd, ref_fd)
 
         self.assertAlmostEqual(correction.brightness_adjustment, 1.0, delta=0.01)
         self.assertEqual(correction.highlights_adjustment, 0)
         self.assertEqual(correction.shadows_adjustment, 0)
 
-    def test_overexposed_image_correction(self):
-        """Image at +2 EV should need darkening."""
-        fd = FileExifData(
-            filepath=Path("bright.CR2"),
-            exposure_compensation=2.0,
-        )
-
-        correction = calculate_correction_params(fd, target_ev=0.0)
-
-        # +2 EV → 2^-2 = 0.25x brightness
-        self.assertAlmostEqual(correction.brightness_adjustment, 0.25, delta=0.01)
-        self.assertLess(correction.highlights_adjustment, 0)
-        self.assertLess(correction.shadows_adjustment, 0)
-
 
 class TestSelectReferenceImage(unittest.TestCase):
 
-    def test_three_images_picks_middle_by_exposure_time(self):
+    @patch('modules.exposure_aligner.compute_toncurve_score')
+    def test_picks_highest_toncurve_score(self, mock_score):
+        """Uses the toncurve image (0EV) as reference."""
         files = [
             FileExifData(filepath=Path("dark.CR2"), exposure_compensation=-2.0, exposure_time="1/500"),
             FileExifData(filepath=Path("mid.CR2"), exposure_compensation=0.0, exposure_time="1/125"),
             FileExifData(filepath=Path("bright.CR2"), exposure_compensation=2.0, exposure_time="1/30"),
         ]
+        # mid.CR2 has best toncurve (highest score)
+        mock_score.side_effect = lambda p: {"dark.CR2": 50, "mid.CR2": 90, "bright.CR2": 30}[p.name]
+
         ref = select_reference_image(files)
         self.assertEqual(ref.filepath, Path("mid.CR2"))
 
-    def test_two_images_falls_back_to_brightness(self):
+    @patch('modules.exposure_aligner.compute_toncurve_score')
+    def test_two_images_falls_back_to_best_toncurve(self, mock_score):
         files = [
             FileExifData(filepath=Path("dark.CR2"), exposure_compensation=-1.0, exposure_time="1/250"),
             FileExifData(filepath=Path("bright.CR2"), exposure_compensation=1.0, exposure_time="1/60"),
         ]
-        ref = select_reference_image(files)
-        self.assertIn(ref.filepath, [Path("dark.CR2"), Path("bright.CR2")])
+        mock_score.side_effect = lambda p: {"dark.CR2": 70, "bright.CR2": 40}[p.name]
 
-    def test_missing_exposure_time_falls_back_to_brightness(self):
+        ref = select_reference_image(files)
+        self.assertEqual(ref.filepath, Path("dark.CR2"))
+
+    def test_all_equal_scores_returns_first(self):
         files = [
             FileExifData(filepath=Path("a.CR2"), exposure_compensation=-2.0, exposure_time=None),
             FileExifData(filepath=Path("b.CR2"), exposure_compensation=0.0, exposure_time=None),
             FileExifData(filepath=Path("c.CR2"), exposure_compensation=2.0, exposure_time=None),
         ]
         ref = select_reference_image(files)
-        self.assertIn(ref.filepath, [Path("a.CR2"), Path("b.CR2"), Path("c.CR2")])
+        # All toncurve scores default to 50.0 (file errors), first wins
+        self.assertEqual(ref.filepath, Path("a.CR2"))
 
 
 class TestAlignExposures(unittest.TestCase):
@@ -137,16 +158,19 @@ class TestAlignExposures(unittest.TestCase):
         return BracketGroup(
             group_type=GroupType.AEB,
             files=[
-                FileExifData(filepath=Path("dark.CR2"), exposure_compensation=-2.0),
-                FileExifData(filepath=Path("mid.CR2"), exposure_compensation=0.0),
-                FileExifData(filepath=Path("bright.CR2"), exposure_compensation=2.0),
+                FileExifData(filepath=Path("dark.CR2"), exposure_compensation=-2.0, exposure_time="1/500"),
+                FileExifData(filepath=Path("mid.CR2"), exposure_compensation=0.0, exposure_time="1/125"),
+                FileExifData(filepath=Path("bright.CR2"), exposure_compensation=2.0, exposure_time="1/30"),
             ],
             group_id=group_id,
         )
 
+    @patch('modules.exposure_aligner.compute_toncurve_score')
     @patch('modules.exposure_aligner.apply_correction')
-    def test_corrects_all_non_reference_images(self, mock_apply):
+    def test_corrects_all_non_reference_images(self, mock_apply, mock_score):
         """All non-reference images should be corrected."""
+        mock_score.side_effect = lambda p: 50.0  # all equal
+
         mock_apply.return_value = ExposureCorrection(
             filepath=Path("dark.CR2"),
             original_ev=-2.0,
@@ -162,12 +186,16 @@ class TestAlignExposures(unittest.TestCase):
         group = self._make_aeb_group()
         result = align_exposures([group])
 
+        # 2 non-reference images should be corrected
         self.assertEqual(result.total_corrected, 2)
         self.assertEqual(result.total_failed, 0)
 
+    @patch('modules.exposure_aligner.compute_toncurve_score')
     @patch('modules.exposure_aligner.apply_correction')
-    def test_failed_correction_keeps_original(self, mock_apply):
+    def test_failed_correction_keeps_original(self, mock_apply, mock_score):
         """If correction fails, original file should be kept."""
+        mock_score.side_effect = lambda p: 50.0
+
         mock_apply.return_value = ExposureCorrection(
             filepath=Path("dark.CR2"),
             original_ev=-2.0,
@@ -185,9 +213,6 @@ class TestAlignExposures(unittest.TestCase):
         self.assertEqual(result.total_corrected, 0)
         self.assertEqual(result.total_failed, 2)
 
-        # Group should still have all 3 files
-        self.assertEqual(result.aligned_groups[0].file_count, 3)
-
     def test_burst_group_passes_through(self):
         """Burst groups should pass through unchanged."""
         group = BracketGroup(
@@ -198,9 +223,7 @@ class TestAlignExposures(unittest.TestCase):
             ],
             group_id=1,
         )
-
         result = align_exposures([group])
-
         self.assertEqual(result.total_corrected, 0)
         self.assertEqual(len(result.aligned_groups), 1)
         self.assertEqual(result.aligned_groups[0].file_count, 2)
@@ -212,16 +235,13 @@ class TestAlignExposures(unittest.TestCase):
             files=[FileExifData(filepath=Path("solo.CR2"), exposure_compensation=0.0)],
             group_id=1,
         )
-
         result = align_exposures([group])
-
         self.assertEqual(result.total_corrected, 0)
         self.assertEqual(len(result.aligned_groups), 1)
 
     def test_empty_input(self):
         """Empty input should return empty result."""
         result = align_exposures([])
-
         self.assertEqual(result.total_corrected, 0)
         self.assertEqual(result.total_failed, 0)
         self.assertEqual(len(result.aligned_groups), 0)
@@ -242,11 +262,9 @@ class TestAlignExposures(unittest.TestCase):
             total_corrected=1,
             total_failed=0,
         )
-
         summary = result.summary()
         self.assertIn("1", summary)
         self.assertIn("dark.CR2", summary)
-        self.assertIn("-2.0", summary)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,8 @@ class FileExifData:
     f_number: Optional[str] = None
     iso: Optional[str] = None
     model: Optional[str] = None
+    drc_applied: bool = False
+    drc_success: bool = False
 
     @property
     def filename(self) -> str:

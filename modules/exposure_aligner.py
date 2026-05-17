@@ -196,37 +196,87 @@ def _parse_exposure_time(exp_value) -> float:
     return float(exp_str)
 
 
+def compute_toncurve_score(filepath: Path) -> float:
+    """
+    Score how 'natural' the toncurve of an image is.
+
+    The best reference image has:
+    - Brightness near mid-gray (128) — not under/overexposed
+    - Low clipping ratio — highlights are preserved
+    - Wide histogram — good contrast range
+
+    Returns:
+        Score 0-100 (higher = better reference candidate)
+    """
+    try:
+        img = Image.open(filepath)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        arr = np.array(img)
+        luminance = (0.2126 * arr[:, :, 0] +
+                     0.7152 * arr[:, :, 1] +
+                     0.0722 * arr[:, :, 2])
+
+        mean_val = float(np.mean(luminance))
+
+        # Brightness score: ideal = 128 (mid-gray)
+        brightness_score = max(0, 100 - abs(mean_val - 128) * 0.8)
+
+        # Clipping penalty: pixels at 250-255
+        clipped = float(np.sum(luminance >= 250)) / luminance.size
+        clipping_penalty = clipped * 100
+
+        # Dynamic range bonus: wider histogram = more natural
+        std_val = float(np.std(luminance))
+        dr_bonus = min(std_val * 0.5, 15)
+
+        # Q1/Q3 balance: well-exposed should have detail in shadows AND highlights
+        q1 = float(np.percentile(luminance, 10))
+        q3 = float(np.percentile(luminance, 90))
+        range_score = min((q3 - q1) / 2.55, 60)
+
+        total = brightness_score - clipping_penalty + dr_bonus + range_score * 0.2
+        return max(0, min(total, 100))
+
+    except Exception as e:
+        logger.warning(f"Toncurve score error for {filepath.name}: {e}")
+        return 50.0
+
+
 def select_reference_image(files: list[FileExifData]) -> FileExifData:
     """
     Select the reference image for exposure alignment.
 
-    - 3-image AEB: middle exposure (by exposure_time)
-    - <3 images: best histogram (closest to mid-gray, 128)
+    Strategy: pick the image with the BEST TONKURVE.
+    In AEB brackets, this is almost always the 0EV (normal exposure):
+    - Not underexposed (stretched curve, more noise)
+    - Not overexposed (clipped highlights)
+    - Most natural contrast distribution
+
+    Uses a composite score based on:
+    - Brightness closeness to mid-gray
+    - Minimal clipping
+    - Good contrast range
 
     Args:
         files: List of FileExifData in the AEB group
 
     Returns:
-        The reference FileExifData
+        The reference FileExifData (best toncurve)
     """
-    if len(files) == 3:
-        files_with_time = [f for f in files if f.exposure_time]
-        if len(files_with_time) == 3:
-            sorted_by_time = sorted(
-                files_with_time,
-                key=lambda f: _parse_exposure_time(f.exposure_time),
-            )
-            return sorted_by_time[1]
-
-    best_fd = None
-    best_diff = float("inf")
+    scored = []
     for fd in files:
-        brightness = estimate_image_brightness(fd.filepath)
-        diff = abs(brightness - 128.0)
-        if diff < best_diff:
-            best_diff = diff
-            best_fd = fd
-    return best_fd or files[0]
+        score = compute_toncurve_score(fd.filepath)
+        scored.append((score, fd))
+        logger.debug(f"  Toncurve {fd.filename}: {score:.1f}")
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best = scored[0][1]
+    logger.info(f"  Reference: {best.filename} (toncurve score={scored[0][0]:.1f})")
+    return best
 
 
 def calculate_correction_params(

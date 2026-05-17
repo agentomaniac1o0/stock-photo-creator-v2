@@ -37,8 +37,18 @@ logger = logging.getLogger(__name__)
 
 # Quality thresholds
 SHARPNESS_GATE_MIN = 10.0
+LOW_LIGHT_SHARPNESS_GATE = 5.0
 NOISE_GATE_MIN = 30.0
-BURST_ACTION_EXP_TIME = 1/250
+LOW_LIGHT_NOISE_GATE = 15.0
+BURST_ACTION_EXP_TIME = 1 / 250
+
+# DRC bonus/malus for comparison scoring
+DRC_NO_NEED_BONUS = 10.0
+DRC_SUCCESS_BONUS = 5.0
+DRC_FAIL_PENALTY = 20.0
+
+# Tie detection: if top scores are within this %, mark for manual review
+TIE_THRESHOLD_PCT = 2.0
 
 
 @dataclass
@@ -88,73 +98,175 @@ class SelectionResult:
         return "\n".join(lines)
 
 
-def passes_hard_filters(metrics: ImageMetrics) -> tuple[bool, str]:
+def detect_low_light_scene(group: BracketGroup, metrics_list: list[ImageMetrics]) -> tuple[bool, str]:
+    """
+    Detect if a group is a low-light scene (indoor, church, night, etc.).
+
+    Low-light scenes should use relaxed thresholds because noise
+    is inherently higher and sharpness is harder to achieve.
+
+    Detection criteria (either qualifies):
+    - ISO > 1600 (from EXIF)
+    - Average group exposure_score < 40
+
+    Returns:
+        (is_low_light, reason)
+    """
+    iso_trigger = False
+    exp_trigger = False
+
+    for fd in group.files:
+        if fd.iso:
+            try:
+                iso_val = int(str(fd.iso))
+                if iso_val > 1600:
+                    iso_trigger = True
+                    break
+            except (ValueError, TypeError):
+                pass
+
+    if metrics_list:
+        avg_exp = sum(m.exposure_score for m in metrics_list) / len(metrics_list)
+        if avg_exp < 40:
+            exp_trigger = True
+
+    reasons = []
+    if iso_trigger:
+        reasons.append("ISO>1600")
+    if exp_trigger:
+        reasons.append(f"avg exposure<40")
+
+    if reasons:
+        return True, f"Low-light detected: {', '.join(reasons)}"
+    return False, ""
+
+
+def passes_hard_filters(metrics: ImageMetrics, low_light: bool = False) -> tuple[bool, str]:
     """
     Step 1: Hard filters — reject too-blurry or unrecoverable images.
+
+    Low-light scenes use a relaxed sharpness gate (5 instead of 10)
+    because handshake at slow shutter speeds is expected.
 
     Returns:
         (passes, reason) - reason is rejection reason if fails
     """
-    if metrics.sharpness_score < SHARPNESS_GATE_MIN:
-        return False, f"Too blurry (sharpness={metrics.sharpness_score:.0f} < {SHARPNESS_GATE_MIN:.0f})"
+    gate = LOW_LIGHT_SHARPNESS_GATE if low_light else SHARPNESS_GATE_MIN
+    label = "low-light" if low_light else "normal"
+    if metrics.sharpness_score < gate:
+        return False, (f"Too blurry ({label}: sharpness={metrics.sharpness_score:.0f} < {gate:.0f})")
     return True, ""
 
 
-def compute_comparison_score(metrics: ImageMetrics) -> tuple[float, float, float]:
+def compute_drc_bonus(fd: FileExifData) -> float:
+    """Calculate DRC bonus based on recovery outcome."""
+    if not fd.drc_applied and not fd.drc_success:
+        return DRC_NO_NEED_BONUS
+    elif fd.drc_applied and fd.drc_success:
+        return DRC_SUCCESS_BONUS
+    elif fd.drc_applied and not fd.drc_success:
+        return -DRC_FAIL_PENALTY
+    return 0.0
+
+
+def compute_comparison_score(metrics: ImageMetrics, fd: FileExifData = None) -> tuple:
     """
     Step 3: Compute comparison score for ranking.
 
-    Primary: noise_curve (higher = less noise)
+    Primary:   noise_curve (higher = less noise)
     Secondary: defect_score (higher = fewer defects)
-    Tertiary: sharpness_curve (higher = sharper)
+    Tertiary:  sharpness_curve (higher = sharper)
+    Quartary:  exposure_score (higher = better exposed)
+    + DRC bonus/malus
 
     Returns:
-        (noise_ranked, defect_score, sharpness_ranked) for sorting
+        (noise_ranked, defect_score, sharpness_ranked, exposure_score)
+        for sorting
     """
     penalty = exposure_correction_penalty(metrics.filepath)
     noise_ranked = noise_curve(metrics.noise_score) - penalty
     sharpness_ranked = sharpness_curve(metrics.sharpness_score)
-    return (noise_ranked, metrics.defect_score, sharpness_ranked)
+
+    drc_bonus = compute_drc_bonus(fd) if fd else 0.0
+    return (noise_ranked + drc_bonus, metrics.defect_score,
+            sharpness_ranked, metrics.exposure_score)
 
 
 def select_best_in_group(
     files: list[FileExifData],
     metrics_list: list[ImageMetrics],
-) -> tuple[FileExifData, ImageMetrics]:
+) -> tuple[FileExifData, ImageMetrics, str]:
     """
-    Select the best image from a group based on noise + defects.
+    Select the best image from a group based on ranking.
+
+    Ranking:
+    1. noise_curve (primary)
+    2. defect_score (secondary)
+    3. sharpness_curve (tertiary)
+    4. exposure_score (quartary)
+    + DRC bonus
+
+    When top-2 candidates are within TIE_THRESHOLD_PCT,
+    the image is flagged for manual review.
 
     Returns:
-        (best_file, best_metrics)
+        (best_file, best_metrics, tie_warning)
     """
     paired = list(zip(files, metrics_list))
-    best_fd, best_m = max(
-        paired,
-        key=lambda x: compute_comparison_score(x[1])
-    )
-    return best_fd, best_m
+    scored = [(compute_comparison_score(m, fd), fd, m) for fd, m in paired]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    best_fd, best_m = scored[0][1], scored[0][2]
+    tie_warning = ""
+
+    if len(scored) >= 2:
+        top_score = scored[0][0][0]
+        second_score = scored[1][0][0]
+        if top_score > 0 and second_score > 0:
+            diff_pct = abs(top_score - second_score) / max(top_score, second_score) * 100
+            if diff_pct < TIE_THRESHOLD_PCT:
+                tie_warning = (
+                    f"TIE: #{scored[0][1].filename} vs #{scored[1][1].filename} "
+                    f"({diff_pct:.1f}% difference) — manual review recommended"
+                )
+
+    return best_fd, best_m, tie_warning
 
 
 def select_from_aeb_group(
     group: BracketGroup,
     metrics_list: list[ImageMetrics],
+    low_light: bool = False,
+    tie_warnings: list[str] = None,
 ) -> tuple[list[Path], list[SelectionDecision]]:
     """
     Select from AEB group:
-    1. Apply hard filters (sharp < 10 → reject)
-    2. From remaining, pick best by noise + defects
-    3. If all fail filters → reject all
+    1. Detect low-light scene → relaxed thresholds
+    2. Apply hard filters (sharp < 10 normal, < 5 low-light)
+    3. Reject DRC failures
+    4. From remaining, pick best by noise → defects → sharpness → exposure + DRC
+    5. Generate tie-warnings when scores are close
     """
     decisions = []
     kept = []
     rejected = []
+    local_ties = tie_warnings if tie_warnings is not None else []
 
     if not group.files:
         return kept, decisions
 
     candidates = []
     for fd, m in zip(group.files, metrics_list):
-        passes, reason = passes_hard_filters(m)
+        if fd.drc_applied and not fd.drc_success:
+            rejected.append(fd.filepath)
+            decisions.append(SelectionDecision(
+                filepath=fd.filepath,
+                decision="reject",
+                reason=f"DRC failed: sky not recoverable",
+            ))
+            continue
+
+        passes, reason = passes_hard_filters(m, low_light=low_light)
         if passes:
             candidates.append((fd, m))
         else:
@@ -169,16 +281,26 @@ def select_from_aeb_group(
         logger.info(f"AEB group #{group.group_id}: ALL images failed hard filters, rejecting all")
         return kept, decisions
 
-    best_fd, best_m = select_best_in_group(
+    best_fd, best_m, tie = select_best_in_group(
         [fd for fd, _ in candidates],
         [m for _, m in candidates],
     )
+    if tie:
+        local_ties.append(f"AEB #{group.group_id}: {tie}")
+
+    drc_label = ""
+    if best_fd.drc_applied and best_fd.drc_success:
+        drc_label = " [DRC sky recovered]"
+    elif not best_fd.drc_applied:
+        drc_label = " [natural highlights]"
+
     kept.append(best_fd.filepath)
     decisions.append(SelectionDecision(
         filepath=best_fd.filepath,
         decision="keep",
-        reason=f"Best quality in AEB group #{group.group_id} "
-               f"(noise={best_m.noise_score:.0f}, defects={best_m.defect_score:.0f})",
+        reason=(f"Best quality in AEB group #{group.group_id} "
+                f"(noise={best_m.noise_score:.0f}, defects={best_m.defect_score:.0f})"
+                f"{drc_label}"),
     ))
 
     for fd, m in candidates:
@@ -191,8 +313,8 @@ def select_from_aeb_group(
             ))
 
     logger.info(f"AEB group #{group.group_id}: kept {best_fd.filename} "
-               f"(noise={best_m.noise_score:.0f}, sharp={best_m.sharpness_score:.0f}), "
-               f"rejected {len(group.files) - len(kept)} other(s)")
+               f"(noise={best_m.noise_score:.0f}, sharp={best_m.sharpness_score:.0f})"
+               f"{drc_label}, rejected {len(group.files) - len(kept)} other(s)")
 
     return kept, decisions
 
@@ -200,22 +322,34 @@ def select_from_aeb_group(
 def select_from_burst_group(
     group: BracketGroup,
     metrics_list: list[ImageMetrics],
+    low_light: bool = False,
+    tie_warnings: list[str] = None,
 ) -> tuple[list[Path], list[SelectionDecision]]:
     """
     Select from burst group:
     - Action sequence (ExpTime < 1/250s): keep all that pass hard filters
-    - Normal burst: keep best by noise + defects
+    - Normal burst: keep best by noise → defects → sharpness → exposure + DRC
     """
     decisions = []
     kept = []
     rejected = []
+    local_ties = tie_warnings if tie_warnings is not None else []
 
     if not group.files:
         return kept, decisions
 
     passed = []
     for fd, m in zip(group.files, metrics_list):
-        passes, reason = passes_hard_filters(m)
+        if fd.drc_applied and not fd.drc_success:
+            rejected.append(fd.filepath)
+            decisions.append(SelectionDecision(
+                filepath=fd.filepath,
+                decision="reject",
+                reason=f"DRC failed: sky not recoverable",
+            ))
+            continue
+
+        passes, reason = passes_hard_filters(m, low_light=low_light)
         if passes:
             passed.append((fd, m))
         else:
@@ -232,25 +366,39 @@ def select_from_burst_group(
 
     if group.is_action_sequence:
         for fd, m in passed:
+            drc_label = ""
+            if fd.drc_applied and fd.drc_success:
+                drc_label = " [DRC]"
             kept.append(fd.filepath)
             decisions.append(SelectionDecision(
                 filepath=fd.filepath,
                 decision="keep",
                 reason=f"Action sequence — passed filters "
-                       f"(noise={m.noise_score:.0f}, sharp={m.sharpness_score:.0f})",
+                       f"(noise={m.noise_score:.0f}, sharp={m.sharpness_score:.0f})"
+                       f"{drc_label}",
             ))
         logger.info(f"Burst group #{group.group_id} (action): kept {len(kept)}")
     else:
-        best_fd, best_m = select_best_in_group(
+        best_fd, best_m, tie = select_best_in_group(
             [fd for fd, _ in passed],
             [m for _, m in passed],
         )
+        if tie:
+            local_ties.append(f"Burst #{group.group_id}: {tie}")
+
+        drc_label = ""
+        if best_fd.drc_applied and best_fd.drc_success:
+            drc_label = " [DRC sky recovered]"
+        elif not best_fd.drc_applied:
+            drc_label = " [natural highlights]"
+
         kept.append(best_fd.filepath)
         decisions.append(SelectionDecision(
             filepath=best_fd.filepath,
             decision="keep",
             reason=f"Best quality in burst group #{group.group_id} "
-                   f"(noise={best_m.noise_score:.0f}, defects={best_m.defect_score:.0f})",
+                   f"(noise={best_m.noise_score:.0f}, defects={best_m.defect_score:.0f})"
+                   f"{drc_label}",
         ))
 
         for fd, m in passed:
@@ -269,10 +417,14 @@ def select_from_burst_group(
 def select_from_single(
     group: BracketGroup,
     metrics_list: list[ImageMetrics],
+    low_light: bool = False,
+    tie_warnings: list[str] = None,
 ) -> tuple[list[Path], list[SelectionDecision]]:
     """
     Select or reject a single image:
+    - Reject DRC failures
     - Keep if passes hard filters AND noise is not too high
+    - Low-light scenes use relaxed noise gate (15 instead of 30)
     """
     decisions = []
     kept = []
@@ -291,7 +443,20 @@ def select_from_single(
         defect_score=50.0,
     )
 
-    passes, reason = passes_hard_filters(m)
+    if fd.drc_applied and not fd.drc_success:
+        rejected.append(fd.filepath)
+        decisions.append(SelectionDecision(
+            filepath=fd.filepath,
+            decision="reject",
+            reason=f"DRC failed: sky not recoverable",
+        ))
+        logger.info(f"Single {fd.filename}: rejected (DRC failed)")
+        return kept, decisions
+
+    noise_gate = LOW_LIGHT_NOISE_GATE if low_light else NOISE_GATE_MIN
+    gate_label = "low-light" if low_light else "normal"
+
+    passes, reason = passes_hard_filters(m, low_light=low_light)
     if not passes:
         rejected.append(fd.filepath)
         decisions.append(SelectionDecision(
@@ -299,23 +464,30 @@ def select_from_single(
             decision="reject",
             reason=f"Failed hard filter: {reason}",
         ))
-    elif m.noise_score < NOISE_GATE_MIN:
+    elif m.noise_score < noise_gate:
         rejected.append(fd.filepath)
         decisions.append(SelectionDecision(
             filepath=fd.filepath,
             decision="reject",
-            reason=f"Too noisy (noise={m.noise_score:.0f} < {NOISE_GATE_MIN:.0f})",
+            reason=f"Too noisy ({gate_label}: noise={m.noise_score:.0f} < {noise_gate:.0f})",
         ))
     else:
+        drc_label = ""
+        if fd.drc_applied and fd.drc_success:
+            drc_label = " [DRC sky recovered]"
+        elif not fd.drc_applied:
+            drc_label = " [natural highlights]"
         kept.append(fd.filepath)
         decisions.append(SelectionDecision(
             filepath=fd.filepath,
             decision="keep",
-            reason=f"Passed filters (noise={m.noise_score:.0f}, sharp={m.sharpness_score:.0f})",
+            reason=f"Passed filters (noise={m.noise_score:.0f}, sharp={m.sharpness_score:.0f})"
+                   f"{drc_label}",
         ))
 
     logger.info(f"Single {fd.filename}: {'kept' if kept else 'rejected'} "
-               f"(noise={m.noise_score:.0f}, sharp={m.sharpness_score:.0f})")
+               f"(noise={m.noise_score:.0f}, sharp={m.sharpness_score:.0f}, "
+               f"{gate_label} gate={noise_gate:.0f})")
 
     return kept, decisions
 
@@ -361,12 +533,16 @@ def generate_selection_report(
     """
     Generate a JSON report of all selection decisions.
     """
+    tie_warnings = [d for d in decisions if "TIE" in d.reason.upper()]
+
     report = {
         "batch_name": batch_name,
         "timestamp": datetime.now().isoformat(),
         "total_decisions": len(decisions),
         "kept": sum(1 for d in decisions if d.decision == "keep"),
         "rejected": sum(1 for d in decisions if d.decision == "reject"),
+        "ties": len(tie_warnings),
+        "tie_details": [d.reason for d in tie_warnings],
         "decisions": [
             {
                 "filename": d.filepath.name,
@@ -406,6 +582,7 @@ def select_and_upload(
     all_decisions = []
     all_kept = []
     all_rejected = []
+    tie_warnings: list[str] = []
 
     metrics_map = {}
     for m in metrics_result.metrics:
@@ -415,18 +592,33 @@ def select_and_upload(
         group_metrics = [metrics_map.get(fd.filepath) for fd in group.files]
         group_metrics = [m for m in group_metrics if m is not None]
 
+        low_light, ll_reason = detect_low_light_scene(group, group_metrics)
+        if low_light:
+            logger.info(f"Group #{group.group_id} [{group.group_type.value}]: {ll_reason}")
+
         if group.group_type == GroupType.AEB:
-            kept, decisions = select_from_aeb_group(group, group_metrics)
+            kept, decisions = select_from_aeb_group(
+                group, group_metrics, low_light=low_light, tie_warnings=tie_warnings)
         elif group.group_type == GroupType.BURST:
-            kept, decisions = select_from_burst_group(group, group_metrics)
+            kept, decisions = select_from_burst_group(
+                group, group_metrics, low_light=low_light, tie_warnings=tie_warnings)
         else:
-            kept, decisions = select_from_single(group, group_metrics)
+            kept, decisions = select_from_single(
+                group, group_metrics, low_light=low_light, tie_warnings=tie_warnings)
 
         all_decisions.extend(decisions)
         all_kept.extend(kept)
         all_rejected.extend([d.filepath for d in decisions if d.decision == "reject"])
 
-    report_path = generate_selection_report(all_decisions, f"{batch_name}_phase_1", temp_dir)
+    report_path = generate_selection_report(
+        all_decisions, f"{batch_name}_phase_1", temp_dir)
+
+    if tie_warnings:
+        logger.info(f"\n{'='*60}")
+        logger.info("  TIE WARNINGS — Manual review recommended:")
+        for tw in tie_warnings:
+            logger.info(f"    ⚠ {tw}")
+        logger.info(f"{'='*60}")
 
     nc_selected_dir = f"{NC_RAW_PATH}/{batch_name}/selected-phase_1"
     upload_success, upload_failed = upload_files(all_kept, nc_client, nc_selected_dir)

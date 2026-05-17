@@ -32,6 +32,8 @@ def parse_args():
     p.add_argument("--batch", default="SW-England-May26-01")
     p.add_argument("--local", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--keep-files", action="store_true",
+                   help="Lokale RAW-Dateien nach Analyse NICHT löschen")
     return p.parse_args()
 
 
@@ -350,8 +352,19 @@ def analyze_groups(
                         diffs[attr] = (sa, ra, d)
                         all_lines.append(f"     {label}: S={sa:.0f} vs R={ra:.0f}  ({icon}{abs(d):.1f})")
 
+                # DRC Detection: check if Select has shadowcompr/highlightcompr edits
+                drc_signal = False
+                for sf in sel:
+                    pp = pp3_cache.get(sf.filepath.stem, "")
+                    if "shadowcompr" in pp or "highlightcompr" in pp or "DRC" in pp:
+                        drc_signal = True
+                        break
+
                 # Interpret
                 reasons = []
+                if drc_signal:
+                    reasons.append("🔄 DRC Himmel-Rettung (shadowcompr/highlightcompr aktiv)")
+
                 if "noise_score" in diffs:
                     nd = diffs["noise_score"][2]
                     if nd > 5:
@@ -378,7 +391,8 @@ def analyze_groups(
                 if reasons:
                     all_lines.append(f"     💡 {', '.join(reasons)}")
                 else:
-                    all_lines.append(f"     💡 Keine Metrik-Unterschiede → Komposition/Augen/Himmel?")
+                    all_lines.append(f"     💡 Metrik-Gleichstand → Tiebreaker (Komposition/Augen/Himmel/"
+                                    f"keine störenden Objekte)")
             else:
                 all_lines.append(f"  ℹ Keine Rejects in dieser Gruppe")
 
@@ -475,7 +489,9 @@ def main():
     # Analyze
     print(f"\n{'='*70}")
     print("  GRUPPEN-ANALYSE")
-    print("  User: Himmel > Rauschen | Augen offen > Schärfe | Bewegungsunschärfe OK")
+    print("  User: Himmel > Rauschen | DRC Himmel-Rettung via shadowcompr/highlightcompr")
+    print("  User: Augen offen > Schärfe | Bewegungsunschärfe OK")
+    print("  User: Tiebreaker bei Metrik-Gleichstand → ohne Menschen/störende Objekte")
     print(f"{'='*70}")
 
     all_lines = analyze_groups(groups, decision_map, metrics_cache, pp3_cache)
@@ -493,6 +509,11 @@ def main():
     print(f"  Gruppen komplett Reject: {n_reject_all}")
     print(f"  Gesamt:                  {len(groups)}")
     print(f"{'='*70}\n")
+
+    if not args.keep_files and local_base.exists():
+        print(f"Räume auf: {local_base}")
+        shutil.rmtree(local_base)
+        print("Cleanup abgeschlossen\n")
 
 
 if __name__ == "__main__":
