@@ -67,7 +67,7 @@ class TestHardFilters(unittest.TestCase):
             exposure_score=30.0, noise_score=50.0,
             sharpness_score=6.0, detail_score=60.0, defect_score=70.0,
         )
-        # Normal: sharp=6 < 10 → fail
+        # Normal: sharp=6 < 7 → fail
         passes_normal, _ = passes_hard_filters(m, low_light=False)
         self.assertFalse(passes_normal)
 
@@ -79,7 +79,7 @@ class TestHardFilters(unittest.TestCase):
         m = ImageMetrics(
             filepath=Path("boundary.CR2"),
             exposure_score=70.0, noise_score=70.0,
-            sharpness_score=10.0, detail_score=60.0, defect_score=80.0,
+            sharpness_score=7.0, detail_score=60.0, defect_score=80.0,
         )
         passes, reason = passes_hard_filters(m)
         self.assertTrue(passes)
@@ -198,15 +198,15 @@ class TestComparisonScore(unittest.TestCase):
         # fd_drc: drc_applied=True, drc_success=True → DRC_SUCCESS_BONUS=+5
         self.assertGreater(score_no[0], score_drc[0])
 
-    def test_penalty_applied_to_corrected(self):
-        fd = FileExifData(filepath=Path("IMG_1567_exposure_corrected.jpg"))
+    def test_penalty_scales_with_ev_diff(self):
+        fd = FileExifData(filepath=Path("IMG_1567.CR2"), ev_diff=2.0)
         m = ImageMetrics(
-            filepath=Path("IMG_1567_exposure_corrected.jpg"), exposure_score=100,
+            filepath=Path("IMG_1567.CR2"), exposure_score=100,
             noise_score=80, sharpness_score=40, detail_score=35, defect_score=60,
         )
         score = compute_comparison_score(m, fd)
-        # noise_curve(80) = 75, minus penalty 5 = 70, + DRC_NO_NEED_BONUS 10 = 80
-        self.assertAlmostEqual(score[0], 80.0)
+        # noise_curve(80) = 75, penalty=min(2*3,15)=6, + DRC_NO_NEED_BONUS 10 = 79
+        self.assertAlmostEqual(score[0], 79.0)
 
     def test_return_tuple_length(self):
         fd = FileExifData(filepath=Path("test.CR2"))
@@ -274,7 +274,7 @@ class TestSelectFromAebGroup(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0], Path("best.CR2"))
 
-    def test_rejects_all_too_blurry(self):
+    def test_last_resort_when_all_too_blurry(self):
         group = BracketGroup(
             group_type=GroupType.AEB,
             files=[
@@ -288,8 +288,10 @@ class TestSelectFromAebGroup(unittest.TestCase):
             ImageMetrics(filepath=Path("blurry2.CR2"), exposure_score=100, noise_score=70, sharpness_score=3, detail_score=55, defect_score=65),
         ]
         kept, decisions = select_from_aeb_group(group, metrics)
-        self.assertEqual(len(kept), 0)
-        self.assertTrue(all(d.decision == "reject" for d in decisions))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0], Path("blurry1.CR2"))
+        keep_decisions = [d for d in decisions if d.decision == "keep"]
+        self.assertTrue(any("LAST RESORT" in d.reason for d in keep_decisions))
 
     def test_rejects_drc_failures(self):
         group = BracketGroup(

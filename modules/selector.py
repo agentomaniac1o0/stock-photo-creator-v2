@@ -31,12 +31,13 @@ from modules.quality_scorer import (
     noise_curve,
     sharpness_curve,
     exposure_correction_penalty,
+    ATMO_SHARPNESS_GATE,
 )
 
 logger = logging.getLogger(__name__)
 
 # Quality thresholds
-SHARPNESS_GATE_MIN = 10.0
+SHARPNESS_GATE_MIN = 7.0
 LOW_LIGHT_SHARPNESS_GATE = 5.0
 NOISE_GATE_MIN = 30.0
 LOW_LIGHT_NOISE_GATE = 15.0
@@ -145,14 +146,23 @@ def passes_hard_filters(metrics: ImageMetrics, low_light: bool = False) -> tuple
     """
     Step 1: Hard filters — reject too-blurry or unrecoverable images.
 
-    Low-light scenes use a relaxed sharpness gate (5 instead of 10)
-    because handshake at slow shutter speeds is expected.
+    Sharpness gates (descending priority):
+    1. Atmo scene (sunset/mood):           gate = 3  (mood > sharpness)
+    2. Low-light (ISO>1600 or exp<40):     gate = 5
+    3. Normal:                              gate = 7
 
     Returns:
         (passes, reason) - reason is rejection reason if fails
     """
-    gate = LOW_LIGHT_SHARPNESS_GATE if low_light else SHARPNESS_GATE_MIN
-    label = "low-light" if low_light else "normal"
+    if metrics.atmo_scene:
+        gate = ATMO_SHARPNESS_GATE
+        label = "atmo"
+    elif low_light:
+        gate = LOW_LIGHT_SHARPNESS_GATE
+        label = "low-light"
+    else:
+        gate = SHARPNESS_GATE_MIN
+        label = "normal"
     if metrics.sharpness_score < gate:
         return False, (f"Too blurry ({label}: sharpness={metrics.sharpness_score:.0f} < {gate:.0f})")
     return True, ""
@@ -173,17 +183,24 @@ def compute_comparison_score(metrics: ImageMetrics, fd: FileExifData = None) -> 
     """
     Step 3: Compute comparison score for ranking.
 
-    Primary:   noise_curve (higher = less noise)
+    Primary:   noise_curve - exposure_push_penalty (higher = better)
+              (images needing heavy brightening are penalized)
     Secondary: defect_score (higher = fewer defects)
     Tertiary:  sharpness_curve (higher = sharper)
     Quartary:  exposure_score (higher = better exposed)
     + DRC bonus/malus
 
+    The exposure push penalty scales continuously: +0.3 EV → ~1pt,
+    +1.0 EV → 3pt, +2.0+ EV → capped at 15pt. This naturally
+    favors slightly-overexposed images (pulled down = no penalty)
+    over underexposed ones (pushed up = heavy penalty).
+
     Returns:
         (noise_ranked, defect_score, sharpness_ranked, exposure_score)
         for sorting
     """
-    penalty = exposure_correction_penalty(metrics.filepath)
+    ev_diff_val = fd.ev_diff if fd else 0.0
+    penalty = exposure_correction_penalty(ev_diff_val)
     noise_ranked = noise_curve(metrics.noise_score) - penalty
     sharpness_ranked = sharpness_curve(metrics.sharpness_score)
 
@@ -278,7 +295,30 @@ def select_from_aeb_group(
             ))
 
     if not candidates:
-        logger.info(f"AEB group #{group.group_id}: ALL images failed hard filters, rejecting all")
+        # Last resort: pick the best among failed-filter images
+        # rather than rejecting the entire group
+        fallback = [(fd, m) for fd, m in zip(group.files, metrics_list)
+                     if not (fd.drc_applied and not fd.drc_success)]
+        if fallback:
+            best_fd, best_m, tie = select_best_in_group(
+                [fd for fd, _ in fallback],
+                [m for _, m in fallback],
+            )
+            kept.append(best_fd.filepath)
+            decisions.append(SelectionDecision(
+                filepath=best_fd.filepath,
+                decision="keep",
+                reason=(f"LAST RESORT in AEB group #{group.group_id} "
+                        f"(sharp={best_m.sharpness_score:.0f}, noise={best_m.noise_score:.0f})"
+                        f" — only candidate"),
+            ))
+            for fd, m in fallback:
+                if fd.filepath != best_fd.filepath:
+                    rejected.append(fd.filepath)
+            logger.info(f"AEB group #{group.group_id}: last resort kept {best_fd.filename} "
+                       f"(sharp={best_m.sharpness_score:.0f})")
+        else:
+            logger.info(f"AEB group #{group.group_id}: ALL images failed, rejecting all")
         return kept, decisions
 
     best_fd, best_m, tie = select_best_in_group(
@@ -361,7 +401,24 @@ def select_from_burst_group(
             ))
 
     if not passed:
-        logger.info(f"Burst group #{group.group_id}: ALL images failed hard filters")
+        # Last resort: pick best among failed-filter images
+        fallback = [(fd, m) for fd, m in zip(group.files, metrics_list)
+                     if not (fd.drc_applied and not fd.drc_success)]
+        if fallback:
+            best_fd, best_m, _ = select_best_in_group(
+                [fd for fd, _ in fallback],
+                [m for _, m in fallback],
+            )
+            kept.append(best_fd.filepath)
+            decisions.append(SelectionDecision(
+                filepath=best_fd.filepath,
+                decision="keep",
+                reason=f"LAST RESORT in burst group #{group.group_id} "
+                       f"(sharp={best_m.sharpness_score:.0f}) — only candidate",
+            ))
+            logger.info(f"Burst group #{group.group_id}: last resort kept {best_fd.filename}")
+        else:
+            logger.info(f"Burst group #{group.group_id}: ALL images failed")
         return kept, decisions
 
     if group.is_action_sequence:
@@ -457,7 +514,34 @@ def select_from_single(
     gate_label = "low-light" if low_light else "normal"
 
     passes, reason = passes_hard_filters(m, low_light=low_light)
-    if not passes:
+    is_drc_fail = fd.drc_applied and not fd.drc_success
+    if not passes and not is_drc_fail:
+        # Last resort: keep single image even if slightly blurry,
+        # as long as noise is acceptable — this is the only
+        # representation of this subject/scene
+        if m.noise_score >= noise_gate:
+            drc_label = ""
+            if fd.drc_applied and fd.drc_success:
+                drc_label = " [DRC sky recovered]"
+            elif not fd.drc_applied:
+                drc_label = " [natural highlights]"
+            kept.append(fd.filepath)
+            decisions.append(SelectionDecision(
+                filepath=fd.filepath,
+                decision="keep",
+                reason=f"LAST RESORT single (sharp={m.sharpness_score:.0f}, "
+                       f"noise={m.noise_score:.0f}) — only candidate{drc_label}",
+            ))
+            logger.info(f"Single {fd.filename}: last resort kept "
+                       f"(sharp={m.sharpness_score:.0f})")
+            return kept, decisions
+        rejected.append(fd.filepath)
+        decisions.append(SelectionDecision(
+            filepath=fd.filepath,
+            decision="reject",
+            reason=f"Failed hard filter + too noisy: {reason}",
+        ))
+    elif not passes:
         rejected.append(fd.filepath)
         decisions.append(SelectionDecision(
             filepath=fd.filepath,

@@ -1,5 +1,5 @@
 """
-Tests for Module 04: Sky Recovery — DRC Highlight Recovery
+Tests for Module 04: Sky Recovery — DRC via pp3 Sidecar
 """
 import shutil
 import tempfile
@@ -14,9 +14,9 @@ from modules.sky_recovery import (
     DRCResult,
     SkyRecoveryResult,
     analyze_highlights,
-    apply_drc_jpeg,
     try_drc_recovery,
     recover_highlights,
+    write_drc_pp3,
 )
 
 
@@ -28,7 +28,6 @@ class TestAnalyzeHighlights(unittest.TestCase):
             img.save(f.name)
             clip_ratio, detail = analyze_highlights(Path(f.name))
         self.assertAlmostEqual(clip_ratio, 0.0, places=2)
-        # No pixels at 230+ → detail is 0 (no highlights to analyze)
         self.assertEqual(detail, 0.0)
 
     def test_clipped_image(self):
@@ -51,7 +50,7 @@ class TestAnalyzeHighlights(unittest.TestCase):
         self.assertLess(clip_ratio, 0.5)
 
 
-class TestApplyDrcJpeg(unittest.TestCase):
+class TestWriteDrcPp3(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = Path(tempfile.mkdtemp())
@@ -59,34 +58,21 @@ class TestApplyDrcJpeg(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_drc_reduces_clipping(self):
-        arr = np.full((200, 200, 3), 220, dtype=np.uint8)
-        # Add gradient in highlights for detail
-        for y in range(200):
-            arr[y, :, :] = np.clip(arr[y, :, :] - y * 0.1, 180, 255)
-        img = Image.fromarray(arr.astype(np.uint8))
-
-        src = self.tmpdir / "test_clip.jpg"
-        img.save(str(src))
-        out = self.tmpdir / "drc" / "test_drc.jpg"
-
-        clip_before, _ = analyze_highlights(src)
-        success = apply_drc_jpeg(src, out, strength=20)
-        clip_after, _ = analyze_highlights(out)
-
+    def test_writes_pp3_with_highlight_compr(self):
+        out = self.tmpdir / "test_drc.pp3"
+        success = write_drc_pp3(Path("test.CR2"), out, strength=15)
         self.assertTrue(success)
-        self.assertGreaterEqual(clip_before, clip_after)
+        self.assertTrue(out.exists())
+        content = out.read_text()
+        self.assertIn("HighlightCompr=75", content)
+        self.assertIn("HLRecovery", content)
 
-    def test_drc_no_clipping_no_change(self):
-        arr = np.full((100, 100, 3), 128, dtype=np.uint8)
-        img = Image.fromarray(arr.astype(np.uint8))
-
-        src = self.tmpdir / "test_noclip.jpg"
-        img.save(str(src))
-        out = self.tmpdir / "drc" / "test_drc.jpg"
-
-        success = apply_drc_jpeg(src, out, strength=20)
+    def test_strength_clamped(self):
+        out = self.tmpdir / "test_drc.pp3"
+        success = write_drc_pp3(Path("test.CR2"), out, strength=50)
         self.assertTrue(success)
+        content = out.read_text()
+        self.assertIn("HighlightCompr=100", content)
 
 
 class TestTryDrcRecovery(unittest.TestCase):
@@ -124,7 +110,6 @@ class TestTryDrcRecovery(unittest.TestCase):
         src = self.tmpdir / "test_flat.jpg"
         img.save(str(src))
         result = try_drc_recovery(src, self.tmpdir)
-        # No detail → DRC skipped even though clipped
         self.assertFalse(result.drc_applied)
 
 
@@ -159,12 +144,11 @@ class TestRecoverHighlights(unittest.TestCase):
     def test_drc_result_dataclass(self):
         r = DRCResult(
             filepath=Path("test.jpg"),
-            output_path=Path("test_drc.jpg"),
+            pp3_path=Path("test_drc.pp3"),
             drc_applied=True,
             drc_success=True,
             clipping_before=0.1,
             highlight_detail_before=0.05,
-            highlight_detail_after=0.3,
             strength_used=15,
         )
         self.assertTrue(r.drc_applied)

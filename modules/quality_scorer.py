@@ -43,6 +43,7 @@ class ImageMetrics:
     sharpness_score: float  # 0-100
     detail_score: float  # 0-100
     defect_score: float  # 0-100 (higher = fewer defects)
+    atmo_scene: bool = False  # True for sunset/mood/atmospheric shots
 
     @property
     def filename(self) -> str:
@@ -303,20 +304,76 @@ def sharpness_curve(sharp_score: float) -> float:
         return 35 + (sharp_score - 35) * 1.5
 
 
-def exposure_correction_penalty(filepath: Path) -> float:
+def exposure_correction_penalty(ev_diff: float) -> float:
     """
-    Penalty for images that were exposure-corrected (brightened).
+    Continuous penalty based on EV push needed for brightening.
 
-    Underexposed images that were brightened have statistically higher
-    noise and are more likely to be unusable. Only applies to files
-    with '_exposure_corrected' in the name.
+    Underexposed images pushed up reveal more noise and lose quality.
+    The penalty scales with the magnitude of the push.
+
+    Rules:
+    - ev_diff <= 1/6 stop (0.167): negligible, no penalty
+    - ev_diff > 0 (brightening):  penalty = min(ev_diff * 3.0, 15.0)
+    - ev_diff < 0 (darkening):    no penalty (pulling down doesn't add noise)
+
+    Args:
+        ev_diff: EV adjustment applied to the image (from pp3 sidecar)
 
     Returns:
-        Penalty value (0-10) to subtract from comparison score.
+        Penalty value 0-15 to subtract from comparison score.
     """
-    if "_exposure_corrected" in filepath.name:
-        return 5.0
-    return 0.0
+    if ev_diff <= 0.167:
+        return 0.0
+    return min(ev_diff * 3.0, 15.0)
+
+
+ATMO_WARMTH_RATIO_MIN = 0.15
+ATMO_SILHOUETTE_MIN = 0.30
+ATMO_SHARPNESS_GATE = 3.0
+
+
+def detect_atmo_scene(rgb: np.ndarray) -> bool:
+    """
+    Detect if an image is an atmospheric/mood scene (sunset, golden hour).
+
+    Such scenes have:
+    1. High warm color ratio (orange/red tones)
+    2. Silhouette contrast pattern (dark foreground + bright sky)
+
+    When detected, the sharpness gate is relaxed because global
+    Tenengrad scores are misleadingly low (large smooth sky areas).
+
+    Args:
+        rgb: RGB uint8 array (H, W, 3)
+
+    Returns:
+        True if atmospheric scene detected
+    """
+    h, w = rgb.shape[:2]
+    r = rgb[:, :, 0].astype(float)
+    g = rgb[:, :, 1].astype(float)
+    b = rgb[:, :, 2].astype(float)
+
+    # Warmth: pixels where red dominates green and blue
+    warm_mask = (r > g + 20) & (r > b + 20) & (r > 60)
+    warm_ratio = float(np.sum(warm_mask)) / (h * w)
+
+    # Silhouette measure: large dark-bottom + bright-top
+    mid_row = h // 2
+    bottom = rgb[mid_row:, :, :]
+    top = rgb[:mid_row, :, :]
+    bottom_lum = np.mean(bottom.astype(float))
+    top_lum = np.mean(top.astype(float))
+    silhouette_ratio = (top_lum - bottom_lum) / (top_lum + bottom_lum + 1)
+
+    is_atmo = (warm_ratio > ATMO_WARMTH_RATIO_MIN and
+               silhouette_ratio > ATMO_SILHOUETTE_MIN)
+
+    if is_atmo:
+        logger.debug(f"Atmo scene detected: warmth={warm_ratio:.2f}, "
+                     f"silhouette={silhouette_ratio:.2f}")
+
+    return is_atmo
 
 
 def compute_metrics(filepath: Path) -> ImageMetrics:
@@ -353,6 +410,8 @@ def compute_metrics(filepath: Path) -> ImageMetrics:
         else:
             defect_score = 70.0
 
+        atmo = detect_atmo_scene(arr)
+
         return ImageMetrics(
             filepath=filepath,
             exposure_score=exposure_score,
@@ -360,6 +419,7 @@ def compute_metrics(filepath: Path) -> ImageMetrics:
             sharpness_score=sharpness_score,
             detail_score=detail_score,
             defect_score=defect_score,
+            atmo_scene=atmo,
         )
 
     except Exception as e:
@@ -371,6 +431,7 @@ def compute_metrics(filepath: Path) -> ImageMetrics:
             sharpness_score=50.0,
             detail_score=50.0,
             defect_score=50.0,
+            atmo_scene=False,
         )
 
 

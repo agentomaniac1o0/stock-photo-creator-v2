@@ -31,6 +31,7 @@ from modules.sky_recovery import recover_highlights
 from modules.overexposure_checker import check_overexposure
 from modules.quality_scorer import compute_all_metrics
 from modules.selector import select_and_upload
+from modules.user_preferences import suggest_brightness_offset, load_preferences, save_preferences
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +46,12 @@ def main():
     parser.add_argument("batch", help="Batch folder name in Nextcloud RAW/")
     parser.add_argument("--max-images", type=int, default=0,
                         help="Limit number of images (for testing)")
+    parser.add_argument("--brightness-offset", type=float, default=None,
+                        help="Override learned brightness offset (EV). "
+                             "Positive = brighter target. Overrides user_preferences.json.")
+    parser.add_argument("--exemplars", nargs="*", default=None,
+                        help="CR2 file(s) representing your ideal brightness. "
+                             "Used to compute brightness_offset automatically.")
     args = parser.parse_args()
 
     BATCH_NAME = args.batch
@@ -88,14 +95,34 @@ def main():
     groups = detect_brackets(import_result.raw_files)
     print(print_group_summary(groups))
 
+    # Determine brightness offset (user preference)
+    brightness_offset = 0.0
+    if args.brightness_offset is not None:
+        brightness_offset = args.brightness_offset
+        logger.info(f"Using manual brightness offset: {brightness_offset:+.3f} EV")
+    elif args.exemplars:
+        exemplar_paths = [Path(p) for p in args.exemplars]
+        brightness_offset = suggest_brightness_offset(exemplar_paths)
+        save_preferences({"brightness_offset": brightness_offset})
+    else:
+        prefs = load_preferences()
+        brightness_offset = prefs.get("brightness_offset", 0.0)
+        if brightness_offset:
+            logger.info(f"Using saved brightness offset: {brightness_offset:+.3f} EV")
+
+    if brightness_offset:
+        logger.info(f"→ Images will be aligned {abs(brightness_offset):.2f} EV "
+                    f"{'brighter' if brightness_offset > 0 else 'darker'} than standard reference")
+
     # Step 3: Exposure Alignment (align ALL to best-toncurve reference)
     logger.info("\n" + "=" * 60)
-    logger.info("STEP 3: Exposure Alignment (to best toncurve)")
+    logger.info("STEP 3: Exposure Alignment")
     logger.info("=" * 60)
 
     exposure_result = align_exposures(
         groups,
         output_dir=import_result.temp_dir / "corrected",
+        brightness_offset=brightness_offset,
     )
     print(exposure_result.summary())
 

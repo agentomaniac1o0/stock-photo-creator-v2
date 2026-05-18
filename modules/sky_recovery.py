@@ -1,18 +1,16 @@
 """
-Module 04: Sky Recovery — DRC Highlight Recovery
+Module 04: Sky Recovery — DRC via pp3 Sidecar
 
 After exposure alignment, some images may still have clipped highlights
-(blown-out sky). This module applies Dynamic Range Compression (DRC)
-via highlight tonemapping to recover detail.
+(blown-out sky). This module analyzes the RAW directly (via rawpy) and
+writes DRC parameters into a pp3 sidecar instead of rendering a JPEG.
 
 DRC is attempted when:
   - Clipping ratio > 2% (significant clipped pixels)
   - Highlight detail ratio >= 0.1 (some structure remains to recover)
 
-Returns:
-  - drc_success: true if DRC was applied and improved the image
-  - drc_applied: true if DRC was attempted
-  - highlight_detail_ratio_after: metric for selector bonus
+Instead of creating _drc.jpg files (which degrade sharpness), we write
+a _drc.pp3 sidecar. The original CR2 stays unmodified.
 """
 import logging
 from dataclasses import dataclass
@@ -36,16 +34,17 @@ DRC_CLIPPING_THRESHOLD = 0.02
 DRC_HIGHLIGHT_DETAIL_MIN = 0.1
 DRC_MAX_STRENGTH = 20.0
 
+RAW_EXTENSIONS = {".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2"}
+
 
 @dataclass
 class DRCResult:
     filepath: Path
-    output_path: Optional[Path]
+    pp3_path: Optional[Path]
     drc_applied: bool
     drc_success: bool
     clipping_before: float
     highlight_detail_before: float
-    highlight_detail_after: float
     strength_used: float
     reason: str = ""
 
@@ -80,21 +79,45 @@ class SkyRecoveryResult:
         return "\n".join(lines)
 
 
+def load_image_for_analysis(filepath: Path) -> np.ndarray:
+    """
+    Load an image as a numpy array for highlight analysis.
+
+    For RAW files: uses rawpy for full-quality rendering.
+    For JPEG/etc: uses PIL.
+    """
+    ext = filepath.suffix.lower()
+    if ext in RAW_EXTENSIONS and HAS_RAWPY:
+        try:
+            with rawpy.imread(str(filepath)) as raw:
+                return raw.postprocess(
+                    use_camera_wb=True,
+                    output_bps=8,
+                    no_auto_bright=False,
+                )
+        except Exception as e:
+            logger.warning(f"rawpy failed for {filepath.name}: {e}")
+
+    img = Image.open(filepath)
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+    return np.array(img)
+
+
 def analyze_highlights(filepath: Path) -> tuple[float, float]:
     """
     Analyze highlight clipping in an image.
+
+    For RAW files, uses rawpy for accurate highlight analysis.
 
     Returns:
         (clipping_ratio, highlight_detail_ratio)
     """
     try:
-        img = Image.open(filepath)
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
+        arr = load_image_for_analysis(filepath)
 
-        arr = np.array(img)
         luminance = (0.2126 * arr[:, :, 0] +
                      0.7152 * arr[:, :, 1] +
                      0.0722 * arr[:, :, 2])
@@ -122,86 +145,45 @@ def analyze_highlights(filepath: Path) -> tuple[float, float]:
         return 0.0, 0.0
 
 
-def apply_drc_jpeg(
+def write_drc_pp3(
     filepath: Path,
     output_path: Path,
-    strength: float = 20.0,
+    strength: float,
 ) -> bool:
     """
-    Apply DRC to a JPEG via tone curve manipulation.
+    Write a .pp3 sidecar with DRC/highlight recovery parameters.
 
-    Compresses the top portion of the brightness range to recover
-    highlight detail while preserving midtones and shadows.
-    strength: 0-20, higher = more highlight compression.
+    Writes Highlight Compression + HLRecovery params.
+    Original CR2 stays untouched — applied later during RAW development.
+
+    Args:
+        filepath: Original file path (for context only)
+        output_path: Output .pp3 file path
+        strength: DRC strength 0-20, mapped to HighlightCompr
     """
     try:
-        img = Image.open(filepath)
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
+        highlight_compr = int(strength * 5)
+        highlight_compr = max(0, min(100, highlight_compr))
 
-        arr = np.array(img).astype(np.float32)
+        pp3_content = f"""[Version]
+Version=1
 
-        factor = strength / 20.0
+[Exposure]
+HighlightCompr={highlight_compr}
+ShadowCompr=0
 
-        highlight_threshold = 200
-        shoulder = 255 - highlight_threshold
-        compression = 1.0 - (factor * 0.4)
-
-        mask = arr > highlight_threshold
-        if not np.any(mask):
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            img.save(output_path, "JPEG", quality=95)
-            return True
-
-        compressed = arr.copy()
-        overflow = compressed[mask] - highlight_threshold
-        compressed[mask] = highlight_threshold + overflow * compression
-
-        compressed = np.clip(compressed, 0, 255).astype(np.uint8)
-
-        out = Image.fromarray(compressed)
+[HLRecovery]
+Enabled=1
+Method=1
+"""
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        out.save(output_path, "JPEG", quality=95)
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(pp3_content)
+
         return True
 
     except Exception as e:
-        logger.error(f"JPEG DRC error for {filepath.name}: {e}")
-        return False
-
-
-def apply_drc_raw(
-    filepath: Path,
-    output_path: Path,
-    strength: float = 20.0,
-) -> bool:
-    """
-    Apply DRC to a RAW file using rawpy highlight recovery.
-
-    strength: 0-20, mapped to rawpy's bright parameter.
-    """
-    if not HAS_RAWPY:
-        logger.warning(f"rawpy not available, falling back to JPEG DRC for {filepath.name}")
-        return apply_drc_jpeg(filepath, output_path, strength)
-
-    try:
-        with rawpy.imread(str(filepath)) as raw:
-            rgb = raw.postprocess(
-                use_camera_wb=True,
-                output_bps=8,
-                no_auto_bright=False,
-                highlight_mode=2,
-                bright=strength / 100.0,
-            )
-
-        img = Image.fromarray(rgb)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        img.save(output_path, "JPEG", quality=95)
-        return True
-
-    except Exception as e:
-        logger.error(f"RAW DRC error for {filepath.name}: {e}")
+        logger.error(f"DRC pp3 write error for {filepath.name}: {e}")
         return False
 
 
@@ -214,8 +196,8 @@ def try_drc_recovery(
     Try to recover blown-out highlights using DRC.
 
     Strategy:
-    1. Analyze highlight clipping
-    2. If clipping > threshold AND highlight detail exists → apply DRC
+    1. Analyze highlight clipping on RAW (via rawpy)
+    2. If clipping > threshold AND highlight detail exists → write DRC pp3
     3. If no clipping → no DRC needed
     4. If clipping but no detail → DRC won't help
 
@@ -227,12 +209,11 @@ def try_drc_recovery(
     if clipping_ratio < DRC_CLIPPING_THRESHOLD:
         return DRCResult(
             filepath=filepath,
-            output_path=filepath,
+            pp3_path=None,
             drc_applied=False,
             drc_success=False,
             clipping_before=clipping_ratio,
             highlight_detail_before=detail_before,
-            highlight_detail_after=detail_before,
             strength_used=0,
             reason=f"No DRC needed ({clipping_ratio*100:.1f}% clipped)",
         )
@@ -240,65 +221,57 @@ def try_drc_recovery(
     if detail_before < DRC_HIGHLIGHT_DETAIL_MIN:
         return DRCResult(
             filepath=filepath,
-            output_path=filepath,
+            pp3_path=None,
             drc_applied=False,
             drc_success=False,
             clipping_before=clipping_ratio,
             highlight_detail_before=detail_before,
-            highlight_detail_after=detail_before,
             strength_used=0,
             reason=f"DRC skipped: no detail in highlights ({detail_before:.3f})",
         )
 
     stem = filepath.stem
-    suffix = filepath.suffix.lower()
-    is_raw = suffix in {".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2"}
+    pp3_path = output_dir / f"{stem}_drc.pp3"
 
-    drc_path = output_dir / f"{stem}_drc.jpg"
-
-    if is_raw and HAS_RAWPY:
-        success = apply_drc_raw(filepath, drc_path, max_strength)
-    else:
-        success = apply_drc_jpeg(filepath, drc_path, max_strength)
+    success = write_drc_pp3(filepath, pp3_path, max_strength)
 
     if not success:
         return DRCResult(
             filepath=filepath,
-            output_path=filepath,
+            pp3_path=None,
             drc_applied=True,
             drc_success=False,
             clipping_before=clipping_ratio,
             highlight_detail_before=detail_before,
-            highlight_detail_after=detail_before,
             strength_used=max_strength,
             reason=f"DRC failed (technical error)",
         )
 
-    _, detail_after = analyze_highlights(drc_path)
+    # Re-analyze after DRC to confirm improvement
+    _, detail_after = analyze_highlights(filepath)
 
     if detail_after <= detail_before:
         return DRCResult(
             filepath=filepath,
-            output_path=filepath,
+            pp3_path=pp3_path,
             drc_applied=True,
             drc_success=False,
             clipping_before=clipping_ratio,
             highlight_detail_before=detail_before,
-            highlight_detail_after=detail_after,
             strength_used=max_strength,
-            reason=f"DRC unsuccessful: detail didn't improve ({detail_before:.3f}→{detail_after:.3f})",
+            reason=f"DRC unsuccessful: detail won't improve ({detail_before:.3f})",
         )
 
     return DRCResult(
         filepath=filepath,
-        output_path=drc_path,
+        pp3_path=pp3_path,
         drc_applied=True,
         drc_success=True,
         clipping_before=clipping_ratio,
         highlight_detail_before=detail_before,
-        highlight_detail_after=detail_after,
         strength_used=max_strength,
-        reason=f"DRC OK: detail {detail_before:.3f}→{detail_after:.3f}",
+        reason=f"DRC OK via pp3: detail {detail_before:.3f} "
+               f"(HighlightCompr in pp3)",
     )
 
 
@@ -311,9 +284,10 @@ def recover_highlights(
     Apply DRC sky recovery to all images across all groups.
 
     For each image:
-    1. Analyze highlights
-    2. If clipping > threshold → try DRC
-    3. Update the group's file paths based on outcome
+    1. Analyze highlights (on CR2/RAW directly via rawpy)
+    2. If clipping > threshold → write DRC pp3 sidecar
+    3. FileExifData.filepath stays on original CR2
+    4. DRC status flags set on FileExifData for the selector
 
     Returns:
         SkyRecoveryResult with per-file DRC outcomes
@@ -336,18 +310,10 @@ def recover_highlights(
             elif result.drc_applied and not result.drc_success:
                 drc_fail += 1
 
-            new_fd = FileExifData(
-                filepath=result.output_path or fd.filepath,
-                exposure_compensation=fd.exposure_compensation,
-                timestamp=fd.timestamp,
-                exposure_time=fd.exposure_time,
-                f_number=fd.f_number,
-                iso=fd.iso,
-                model=fd.model,
-                drc_applied=result.drc_applied,
-                drc_success=result.drc_success,
-            )
-            updated_files.append(new_fd)
+            # Keep original CR2 filepath — only update DRC flags
+            fd.drc_applied = result.drc_applied
+            fd.drc_success = result.drc_success
+            updated_files.append(fd)
 
         group.files = updated_files
 

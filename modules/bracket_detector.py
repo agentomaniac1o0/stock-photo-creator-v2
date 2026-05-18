@@ -43,6 +43,9 @@ class FileExifData:
     model: Optional[str] = None
     drc_applied: bool = False
     drc_success: bool = False
+    exposure_corrected: bool = False
+    exposure_corrected_pp3: Optional[Path] = None
+    ev_diff: float = 0.0
 
     @property
     def filename(self) -> str:

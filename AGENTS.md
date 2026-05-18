@@ -20,7 +20,8 @@ Jeder Pipeline-Schritt ist ein eigenes Modul mit:
 |-------|-------|---------|--------|
 | 01 | `modules/importer.py` | RAWs aus Nextcloud laden | ✅ |
 | 02 | `modules/bracket_detector.py` | AEB vs. Burst vs. Single erkennen | ✅ |
-| 03 | `modules/exposure_aligner.py` | Belichtung angleichen (beste Tonkurve als Referenz) | ✅ |
+| 03 | `modules/exposure_aligner.py` | Belichtung angleichen (beste Tonkurve + optional user brightness_offset) | ✅ |
+| -- | `modules/user_preferences.py` | Lernt Wunschhelligkeit aus User-Exemplaren, speichert als brightness_offset | ✅ |
 | 04 | `modules/sky_recovery.py` | DRC Highlight Recovery (Himmel retten via Tonkompression) | ✅ |
 | 05 | `modules/overexposure_checker.py` | Clipping prüfen (nach Alignment+DRC) | ✅ |
 | 06 | `modules/quality_scorer.py` | Qualitätsmetriken (rawpy für volles RAW) | ✅ |
@@ -40,11 +41,15 @@ Nextcloud RAW/{batch}/
     ├─→ 01_importer: RAWs + Sidecars von Nextcloud laden
     ├─→ 02_bracket_detector: AEB / Burst / Single gruppieren + Action-Flag
     │
-    ├─→ 03_exposure_aligner: ALLE auf beste Tonkurve angleichen
+    ├─→ [optional] user_preferences: brightness_offset aus User-Exemplaren
+    │   └─→ Wunschhelligkeit = median raw luminance der Exemplare
+    │   └─→ Offset = log2(target_lum / reference_lum), z.B. +0.35 EV
+    │
+    ├─→ 03_exposure_aligner: ALLE auf beste Tonkurve + user offset angleichen
     │   └─→ Referenz = Bild mit bester Tonkurve (histogramm-basiert:
     │       Midton-Nähe + wenig Clipping + gute Kontrastspanne)
-    │   └─→ Alle anderen auf Referenz-Helligkeit angleichen
-    │   └─→ → {stem}_exposure_corrected.jpg
+    │   └─→ ev_diff = log2(t_ref / t_cur) + brightness_offset
+    │   └─→ → {stem}_exposure_corrected.pp3 (Compensation = ev_diff)
     │
     ├─→ 04_sky_recovery: DRC auf verbleibende Überstrahlungen
     │   └─→ Jedes alignte Bild prüfen:
@@ -59,10 +64,11 @@ Nextcloud RAW/{batch}/
     │
     ├─→ 06_quality_scorer: Metriken auf den finalen Bildern
     │   └─→ noise, sharpness, defects, exposure, detail einzeln
+    │   └─→ atmo_scene flag (warm-tones + Silhouette → sunset/mood)
     │
     ├─→ 07_selector: Low-Light/DRC/Tie-bewusste Selektion
     │   └─→ Schritt 1: Low-Light erkennen (ISO>1600 | Ø exposure<40)
-    │       • Normal:   sharpness_gate = 10, noise_gate = 30
+    │       • Normal:   sharpness_gate =  7, noise_gate = 30
     │       • Low-Light: sharpness_gate =  5, noise_gate = 15
     │   └─→ Schritt 2: DRC-Fail aussortieren
     │   └─→ Schritt 3: Harte Filter (sharpness < gate → reject)
@@ -112,14 +118,17 @@ Nextcloud RAW/{batch}/cleaned/
 | Modul-Struktur | Ein Modul pro Schritt |
 | EXIF-Keys | exiftool -json gibt Keys OHNE "EXIF:" Präfix zurück |
 | CR2-Rendering | rawpy für volles RAW-Rendering (nicht PIL Thumbnail) |
-| Hard Filter (normal) | sharpness < 10 → reject |
+| Hard Filter (normal) | sharpness < 7 → reject (gesenkt von 10, Last Resort bei Einzelbildern) |
 | Hard Filter (low-light) | sharpness < 5 → reject (ISO>1600 oder Ø exposure<40) |
+| Hard Filter (atmo scene) | sharpness < 3 → reject (Sonnenuntergang/Mood-Szenen: Stimmung > Schärfe) |
 | Noise-Gate (normal) | single noise < 30 → reject |
 | Noise-Gate (low-light) | single noise < 15 → reject |
 | Tie-Detection | Top-2 < 2% Unterschied → "manuelle Prüfung" im Report |
+| Last Resort | Wenn alle Bilder einer Gruppe durch Hard Filter fallen → bestes wird trotzdem behalten (mit Warnung) — damit kein Motiv komplett verloren geht |
 | Noise-Vergleich | noise_curve() mit diminishing returns ab 70, Penalty ab 40 |
 | Sharpness-Vergleich | sharpness_curve() mit Bonus ab 35, Penalty unter 15 |
-| Exposure-Penalty | -5 Punkte für exposure-corrected Bilder (aufgehellt) |
+| Exposure-Penalty | Kontinuierlich: min(ev_diff × 3, 15) Punkte für Brightening; Pull-Down = keine Strafe (beginnt erst > 1/6 EV) |
+| Brightness-Offset | User-Preference aus `user_preferences.py`; wird auf alle EV-Diffs addiert (positive = heller). Via `--exemplars` oder `--brightness-offset` setzbar |
 | Action-Erkennung | ExposureTime < 1/250s → alle Burst-Bilder behalten die Filter bestehen |
 | Burst-Auswahl | Normal: 1 bestes Bild; Action: alle die Filter bestehen |
 
@@ -147,6 +156,12 @@ Nextcloud RAW/{batch}/cleaned/
 
 # Test-Run (30 Bilder)
 .venv/bin/python3 test_run.py
+
+# Mit User-Preference lernen (exemplarische CR2s für Wunschhelligkeit)
+.venv/bin/python3 run_phase_1.py SW-England-May26-01 --exemplars 1551.CR2 1533.CR2
+
+# Manueller brightness_offset (überschreibt gelernten Wert)
+.venv/bin/python3 run_phase_1.py SW-England-May26-01 --brightness-offset 0.35
 ```
 
 ### Nextcloud Verzeichnisstruktur

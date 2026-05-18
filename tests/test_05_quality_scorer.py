@@ -20,6 +20,7 @@ from modules.quality_scorer import (
     exposure_correction_penalty,
     compute_metrics,
     compute_all_metrics,
+    detect_atmo_scene,
 )
 
 
@@ -209,11 +210,67 @@ class TestNonLinearCurves(unittest.TestCase):
     def test_sharpness_curve_boundary_35(self):
         self.assertAlmostEqual(sharpness_curve(35), 35.0)
 
-    def test_exposure_penalty_corrected_file(self):
-        self.assertAlmostEqual(exposure_correction_penalty(Path("IMG_1567_exposure_corrected.jpg")), 5.0)
+    def test_exposure_penalty_small_push(self):
+        self.assertAlmostEqual(exposure_correction_penalty(0.3), 0.9)
 
-    def test_exposure_penalty_raw_file(self):
-        self.assertAlmostEqual(exposure_correction_penalty(Path("IMG_1567.CR2")), 0.0)
+    def test_exposure_penalty_large_push(self):
+        self.assertAlmostEqual(exposure_correction_penalty(2.0), 6.0)
+
+    def test_exposure_penalty_capped(self):
+        self.assertAlmostEqual(exposure_correction_penalty(10.0), 15.0)
+
+    def test_exposure_penalty_negligible(self):
+        self.assertAlmostEqual(exposure_correction_penalty(0.1), 0.0)
+
+    def test_exposure_penalty_negative_pull(self):
+        self.assertAlmostEqual(exposure_correction_penalty(-1.0), 0.0)
+
+    def test_exposure_penalty_zero(self):
+        self.assertAlmostEqual(exposure_correction_penalty(0.0), 0.0)
+
+
+class TestDetectAtmoScene(unittest.TestCase):
+
+    def test_neutral_gray_not_atmo(self):
+        arr = np.full((100, 100, 3), 128, dtype=np.uint8)
+        self.assertFalse(detect_atmo_scene(arr))
+
+    def test_warm_sunset_detected(self):
+        arr = np.zeros((100, 100, 3), dtype=np.uint8)
+        arr[:40, :, 0] = 255
+        arr[:40, :, 1] = 120
+        arr[:40, :, 2] = 40
+        self.assertTrue(detect_atmo_scene(arr))
+
+    def test_warm_no_silhouette_not_atmo(self):
+        arr = np.full((100, 100, 3), 128, dtype=np.uint8)
+        arr[:, :, 0] = 220
+        arr[:, :, 1] = 150
+        arr[:, :, 2] = 80
+        self.assertFalse(detect_atmo_scene(arr))
+
+    def test_bw_image_not_atmo(self):
+        gray = np.full((100, 100), 128, dtype=np.uint8)
+        arr = np.stack([gray, gray, gray], axis=2)
+        self.assertFalse(detect_atmo_scene(arr))
+
+    def test_true_sunset_silhouette(self):
+        arr = np.zeros((200, 200, 3), dtype=np.uint8)
+        arr[:100, :, 0] = 255
+        arr[:100, :, 1] = 140
+        arr[:100, :, 2] = 50
+        self.assertTrue(detect_atmo_scene(arr))
+
+    def test_compute_metrics_sets_atmo_flag(self):
+        arr = np.zeros((200, 200, 3), dtype=np.uint8)
+        arr[:100, :, 0] = 255
+        arr[:100, :, 1] = 140
+        arr[:100, :, 2] = 50
+        arr[100:, :, :] = 30
+
+        with patch('modules.quality_scorer.load_image_array', return_value=arr):
+            m = compute_metrics(Path("sunset.CR2"))
+            self.assertTrue(m.atmo_scene)
 
 
 class TestComputeMetrics(unittest.TestCase):

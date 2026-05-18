@@ -26,9 +26,7 @@ class TestExposureCorrection(unittest.TestCase):
             filepath=Path("/tmp/IMG_001.CR2"),
             original_ev=-2.0,
             target_ev=0.0,
-            brightness_adjustment=4.0,
-            highlights_adjustment=60.0,
-            shadows_adjustment=100.0,
+            ev_diff=2.0,
         )
         self.assertEqual(correction.filename, "IMG_001.CR2")
 
@@ -37,7 +35,6 @@ class TestEstimateImageBrightness(unittest.TestCase):
 
     @patch('modules.exposure_aligner.Image.open')
     def test_brightness_estimation(self, mock_open):
-        """Should return average luminance."""
         mock_img = MagicMock()
         mock_img.mode = "RGB"
         mock_open.return_value = mock_img
@@ -49,7 +46,6 @@ class TestEstimateImageBrightness(unittest.TestCase):
 
     @patch('modules.exposure_aligner.Image.open', side_effect=Exception("test error"))
     def test_brightness_estimation_error(self, mock_open):
-        """Should return default mid-gray on error."""
         brightness = estimate_image_brightness(Path("test.CR2"))
         self.assertEqual(brightness, 128.0)
 
@@ -77,7 +73,7 @@ class TestComputeToncurveScore(unittest.TestCase):
 class TestCalculateCorrectionParams(unittest.TestCase):
 
     def test_underexposed_image_correction(self):
-        """Image at -2 EV should need significant brightening."""
+        """Image at -2 EV should need brightening (+2 EV diff)."""
         fd = FileExifData(
             filepath=Path("dark.CR2"),
             exposure_compensation=-2.0,
@@ -91,12 +87,10 @@ class TestCalculateCorrectionParams(unittest.TestCase):
         correction = calculate_correction_params(fd, ref_fd)
 
         self.assertEqual(correction.original_ev, -2.0)
-        self.assertGreater(correction.brightness_adjustment, 1.0)
-        self.assertGreater(correction.highlights_adjustment, 0)
-        self.assertGreater(correction.shadows_adjustment, 0)
+        self.assertGreater(correction.ev_diff, 1.0)
 
     def test_well_exposed_image_no_correction(self):
-        """Image at 0 EV with same exposure time as ref should need minimal."""
+        """Same exposure time as ref → minimal EV diff."""
         fd = FileExifData(
             filepath=Path("mid.CR2"),
             exposure_compensation=0.0,
@@ -109,9 +103,7 @@ class TestCalculateCorrectionParams(unittest.TestCase):
         )
         correction = calculate_correction_params(fd, ref_fd)
 
-        self.assertAlmostEqual(correction.brightness_adjustment, 1.0, delta=0.01)
-        self.assertEqual(correction.highlights_adjustment, 0)
-        self.assertEqual(correction.shadows_adjustment, 0)
+        self.assertAlmostEqual(correction.ev_diff, 0.0, delta=0.01)
 
 
 class TestSelectReferenceImage(unittest.TestCase):
@@ -169,42 +161,36 @@ class TestAlignExposures(unittest.TestCase):
     @patch('modules.exposure_aligner.apply_correction')
     def test_corrects_all_non_reference_images(self, mock_apply, mock_score):
         """All non-reference images should be corrected."""
-        mock_score.side_effect = lambda p: 50.0  # all equal
-
-        mock_apply.return_value = ExposureCorrection(
-            filepath=Path("dark.CR2"),
-            original_ev=-2.0,
-            target_ev=0.0,
-            brightness_adjustment=4.0,
-            highlights_adjustment=60.0,
-            shadows_adjustment=100.0,
-            corrected_path=Path("dark_exposure_corrected.jpg"),
-            success=True,
-            reason="Corrected",
-        )
-
-        group = self._make_aeb_group()
-        result = align_exposures([group])
-
-        # 2 non-reference images should be corrected
-        self.assertEqual(result.total_corrected, 2)
-        self.assertEqual(result.total_failed, 0)
-
-    @patch('modules.exposure_aligner.compute_toncurve_score')
-    @patch('modules.exposure_aligner.apply_correction')
-    def test_failed_correction_keeps_original(self, mock_apply, mock_score):
-        """If correction fails, original file should be kept."""
         mock_score.side_effect = lambda p: 50.0
 
         mock_apply.return_value = ExposureCorrection(
             filepath=Path("dark.CR2"),
             original_ev=-2.0,
             target_ev=0.0,
-            brightness_adjustment=4.0,
-            highlights_adjustment=60.0,
-            shadows_adjustment=100.0,
+            ev_diff=2.0,
+            pp3_path=Path("dark_exposure_corrected.pp3"),
+            success=True,
+            reason="pp3 sidecar: Δ+2.00EV",
+        )
+
+        group = self._make_aeb_group()
+        result = align_exposures([group])
+
+        self.assertEqual(result.total_corrected, 2)
+        self.assertEqual(result.total_failed, 0)
+
+    @patch('modules.exposure_aligner.compute_toncurve_score')
+    @patch('modules.exposure_aligner.apply_correction')
+    def test_failed_correction_keeps_original(self, mock_apply, mock_score):
+        mock_score.side_effect = lambda p: 50.0
+
+        mock_apply.return_value = ExposureCorrection(
+            filepath=Path("dark.CR2"),
+            original_ev=-2.0,
+            target_ev=0.0,
+            ev_diff=2.0,
             success=False,
-            reason="Correction failed",
+            reason="pp3 write failed",
         )
 
         group = self._make_aeb_group()
@@ -247,16 +233,13 @@ class TestAlignExposures(unittest.TestCase):
         self.assertEqual(len(result.aligned_groups), 0)
 
     def test_summary_output(self):
-        """Summary should contain meaningful information."""
         result = ExposureAlignResult(
             aligned_groups=[],
             corrections=[ExposureCorrection(
                 filepath=Path("dark.CR2"),
                 original_ev=-2.0,
                 target_ev=0.0,
-                brightness_adjustment=4.0,
-                highlights_adjustment=60.0,
-                shadows_adjustment=100.0,
+                ev_diff=2.0,
                 success=True,
             )],
             total_corrected=1,

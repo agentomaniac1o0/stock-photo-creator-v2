@@ -113,7 +113,19 @@ def main():
     logger.info("STEP 4: Align exposures for underexposed images")
     logger.info("=" * 60)
 
-    exposure_result = align_exposures(groups, output_dir=import_result.temp_dir / "corrected")
+    prefs = {}
+    try:
+        from modules.user_preferences import load_preferences
+        prefs = load_preferences()
+    except ImportError:
+        pass
+    brightness_offset = prefs.get("brightness_offset", 0.0)
+
+    exposure_result = align_exposures(
+        groups,
+        output_dir=import_result.temp_dir / "corrected",
+        brightness_offset=brightness_offset,
+    )
     print(exposure_result.summary())
 
     if exposure_result.total_failed > 0:
