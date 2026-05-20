@@ -44,6 +44,8 @@ class ImageMetrics:
     detail_score: float  # 0-100
     defect_score: float  # 0-100 (higher = fewer defects)
     atmo_scene: bool = False  # True for sunset/mood/atmospheric shots
+    blur_type: str = "none"  # "none", "defocus", "soft", "motion", "shake"
+    blur_recoverable: bool = True
 
     @property
     def filename(self) -> str:
@@ -57,6 +59,8 @@ class ImageMetrics:
             "sharpness_score": round(self.sharpness_score, 1),
             "detail_score": round(self.detail_score, 1),
             "defect_score": round(self.defect_score, 1),
+            "blur_type": self.blur_type,
+            "blur_recoverable": self.blur_recoverable,
         }
 
 
@@ -80,10 +84,13 @@ class MetricsResult:
             lines.append("")
             lines.append("  Metrics:")
             for m in sorted(self.metrics, key=lambda x: x.noise_score, reverse=True):
+                blur_info = ""
+                if m.blur_type != "none":
+                    blur_info = f", blur={m.blur_type}{'' if m.blur_recoverable else '!'}"
                 lines.append(f"    {m.filename}: "
                            f"exp={m.exposure_score:.0f}, noise={m.noise_score:.0f}, "
                            f"sharp={m.sharpness_score:.0f}, detail={m.detail_score:.0f}, "
-                           f"defects={m.defect_score:.0f}")
+                           f"defects={m.defect_score:.0f}{blur_info}")
         lines.append(f"{'='*60}")
         return "\n".join(lines)
 
@@ -376,6 +383,92 @@ def detect_atmo_scene(rgb: np.ndarray) -> bool:
     return is_atmo
 
 
+def classify_blur_type(gray: np.ndarray, sharpness_score: float) -> tuple[str, bool]:
+    """
+    Classify the type of blur using directional Sobel gradient analysis.
+
+    Only classifies images with sharpness_score < 15 (already blurry).
+    For sharper images, returns ("none", True).
+
+    Method:
+    1. Compute Sobel X and Sobel Y gradients
+    2. mean_gx = mean(|Gx|), mean_gy = mean(|Gy|)
+    3. directional_ratio = min(mean_gx, mean_gy) / max(mean_gx, mean_gy)
+    4. Classify based on overall magnitude + directionality
+
+    Returns:
+        (blur_type, recoverable)
+    """
+    if sharpness_score >= 15:
+        return "none", True
+
+    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
+    sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float64)
+
+    gx = scipy_convolve(gray.astype(np.float64), sobel_x)
+    gy = scipy_convolve(gray.astype(np.float64), sobel_y)
+
+    mean_gx = float(np.mean(np.abs(gx)))
+    mean_gy = float(np.mean(np.abs(gy)))
+    mean_mag = float(np.mean(np.sqrt(gx ** 2 + gy ** 2)))
+
+    max_dir = max(mean_gx, mean_gy)
+    min_dir = min(mean_gx, mean_gy)
+    directional_ratio = min_dir / max_dir if max_dir > 0 else 1.0
+
+    SHAKE_MAG_THRESHOLD = 15.0
+    BALANCE_THRESHOLD = 0.65
+    MOTION_RATIO = 0.5
+
+    if mean_mag < SHAKE_MAG_THRESHOLD:
+        if directional_ratio > BALANCE_THRESHOLD:
+            return "defocus", True
+        else:
+            return "shake", False
+
+    if directional_ratio < MOTION_RATIO:
+        return "motion", False
+
+    return "soft", True
+
+
+def detect_highlight_detail_loss(rgb: np.ndarray) -> float:
+    """
+    Detect detail loss in clipped/highlight areas.
+
+    Measures the ratio of gradient energy in near-clipped vs mid-tone regions.
+    A low ratio means highlights have lost detail (blown out) that DRC could recover.
+
+    Args:
+        rgb: RGB uint8 array (H, W, 3)
+
+    Returns:
+        detail_loss_score: 0.0 (no loss) to 1.0 (severe highlight detail loss)
+    """
+    gray = np.mean(rgb.astype(np.float64), axis=2)
+
+    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
+    sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float64)
+    gx = scipy_convolve(gray, sobel_x)
+    gy = scipy_convolve(gray, sobel_y)
+    gradient_mag = np.sqrt(gx ** 2 + gy ** 2)
+
+    near_clip = gray > 230
+    mid_tones = (gray > 60) & (gray < 180)
+
+    if not np.any(near_clip) or not np.any(mid_tones):
+        return 0.0
+
+    clip_grad = float(np.mean(gradient_mag[near_clip]))
+    mid_grad = float(np.mean(gradient_mag[mid_tones]))
+
+    if mid_grad < 1.0:
+        return 0.0
+
+    loss_ratio = 1.0 - (clip_grad / mid_grad)
+    return max(0.0, min(1.0, loss_ratio))
+
+
 def compute_metrics(filepath: Path) -> ImageMetrics:
     """
     Compute individual quality metrics for a single image.
@@ -412,6 +505,8 @@ def compute_metrics(filepath: Path) -> ImageMetrics:
 
         atmo = detect_atmo_scene(arr)
 
+        blur_type, blur_recoverable = classify_blur_type(gray, sharpness_score)
+
         return ImageMetrics(
             filepath=filepath,
             exposure_score=exposure_score,
@@ -420,6 +515,8 @@ def compute_metrics(filepath: Path) -> ImageMetrics:
             detail_score=detail_score,
             defect_score=defect_score,
             atmo_scene=atmo,
+            blur_type=blur_type,
+            blur_recoverable=blur_recoverable,
         )
 
     except Exception as e:
@@ -432,6 +529,8 @@ def compute_metrics(filepath: Path) -> ImageMetrics:
             detail_score=50.0,
             defect_score=50.0,
             atmo_scene=False,
+            blur_type="none",
+            blur_recoverable=True,
         )
 
 

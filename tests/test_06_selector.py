@@ -162,9 +162,32 @@ class TestComparisonScore(unittest.TestCase):
         )
         score1 = compute_comparison_score(m1, fd)
         score2 = compute_comparison_score(m2, fd)
-        self.assertGreater(score1[0], score2[0])
+        # noise=80 vs 50 is a large gap (noise_curve 75 vs 50)
+        # sharp=40 vs 50 is a smaller gap (sharpness_curve 42.5 vs 57.5)
+        # Weighted: 75+42.5*1.5=138.75 vs 50+57.5*1.5=136.25 → still wins
+        self.assertGreater(score1, score2)
 
-    def test_exposure_as_4th_tier(self):
+    def test_weighted_sharpness_overtakes_noise(self):
+        """When sharpness gap is large and noise gap small, sharpness wins."""
+        fd = FileExifData(filepath=Path("test.CR2"))
+        m_sharp = ImageMetrics(
+            filepath=Path("sharp.CR2"), exposure_score=80,
+            noise_score=55, sharpness_score=50, detail_score=30, defect_score=60,
+        )
+        m_noisy = ImageMetrics(
+            filepath=Path("noisy.CR2"), exposure_score=80,
+            noise_score=60, sharpness_score=30, detail_score=30, defect_score=60,
+        )
+        # noise_curve(55)=55, noise_curve(60)=60 → gap=5
+        # sharpness_curve(50)=57.5, sharpness_curve(30)=30 → gap=27.5×1.5=41.25
+        # m_sharp: 55 + 57.5*1.5 + 6 + 8 = 55+86.25+14 = 155.25
+        # m_noisy: 60 + 30*1.5 + 6 + 8 = 60+45+14 = 119
+        score_sharp = compute_comparison_score(m_sharp, fd)
+        score_noisy = compute_comparison_score(m_noisy, fd)
+        self.assertGreater(score_sharp, score_noisy)
+
+    def test_exposure_tiebreaks_equal(self):
+        """When noise+sharpness+defects are identical, exposure decides."""
         fd = FileExifData(filepath=Path("test.CR2"))
         m1 = ImageMetrics(
             filepath=Path("test.CR2"), exposure_score=95,
@@ -174,13 +197,12 @@ class TestComparisonScore(unittest.TestCase):
             filepath=Path("test2.CR2"), exposure_score=60,
             noise_score=70, sharpness_score=30, detail_score=30, defect_score=60,
         )
+        # noise_curve(70)=70, sharpness_curve(30)=30
+        # m1: 70 + 30*1.5 + 6 + 9.5 = 70+45+15.5 = 130.5
+        # m2: 70 + 30*1.5 + 6 + 6 = 70+45+12 = 127
         score1 = compute_comparison_score(m1, fd)
         score2 = compute_comparison_score(m2, fd)
-        # noise+defects+sharpness identical → exposure_score decides
-        self.assertEqual(score1[0], score2[0])
-        self.assertEqual(score1[1], score2[1])
-        self.assertEqual(score1[2], score2[2])
-        self.assertGreater(score1[3], score2[3])
+        self.assertGreater(score1, score2)
 
     def test_drc_bonus_applied(self):
         fd_no_drc = FileExifData(filepath=Path("clean.CR2"))
@@ -194,9 +216,7 @@ class TestComparisonScore(unittest.TestCase):
         score_no = compute_comparison_score(m, fd_no_drc)
         score_drc = compute_comparison_score(m, fd_drc)
         # DRC success bonus = +5 vs no-drc bonus = +10
-        # Wait: fd_no_drc: drc_applied=False → DRC_NO_NEED_BONUS=+10
-        # fd_drc: drc_applied=True, drc_success=True → DRC_SUCCESS_BONUS=+5
-        self.assertGreater(score_no[0], score_drc[0])
+        self.assertGreater(score_no, score_drc)
 
     def test_penalty_scales_with_ev_diff(self):
         fd = FileExifData(filepath=Path("IMG_1567.CR2"), ev_diff=2.0)
@@ -205,17 +225,21 @@ class TestComparisonScore(unittest.TestCase):
             noise_score=80, sharpness_score=40, detail_score=35, defect_score=60,
         )
         score = compute_comparison_score(m, fd)
-        # noise_curve(80) = 75, penalty=min(2*3,15)=6, + DRC_NO_NEED_BONUS 10 = 79
-        self.assertAlmostEqual(score[0], 79.0)
+        # noise_curve(80)=75, sharpness_curve(40)=42.5
+        # penalty=min(2*3,15)=6
+        # 75*1 + 42.5*1.5 + 60*0.1 + 100*0.1 - 6 + 10
+        # = 75 + 63.75 + 6 + 10 - 6 + 10 = 158.75
+        expected = 75.0 + 42.5 * 1.5 + 60 * 0.1 + 100 * 0.1 - 6.0 + 10.0
+        self.assertAlmostEqual(score, expected)
 
-    def test_return_tuple_length(self):
+    def test_returns_float(self):
         fd = FileExifData(filepath=Path("test.CR2"))
         m = ImageMetrics(
             filepath=Path("test.CR2"), exposure_score=80,
             noise_score=60, sharpness_score=30, detail_score=30, defect_score=60,
         )
         score = compute_comparison_score(m, fd)
-        self.assertEqual(len(score), 4)
+        self.assertIsInstance(score, float)
 
 
 class TestSelectBestInGroup(unittest.TestCase):

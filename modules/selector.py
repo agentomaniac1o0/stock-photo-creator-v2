@@ -154,6 +154,9 @@ def passes_hard_filters(metrics: ImageMetrics, low_light: bool = False) -> tuple
     Returns:
         (passes, reason) - reason is rejection reason if fails
     """
+    if not metrics.blur_recoverable:
+        return False, (f"Unrecoverable blur ({metrics.blur_type}: "
+                       f"sharpness={metrics.sharpness_score:.0f})")
     if metrics.atmo_scene:
         gate = ATMO_SHARPNESS_GATE
         label = "atmo"
@@ -179,34 +182,54 @@ def compute_drc_bonus(fd: FileExifData) -> float:
     return 0.0
 
 
-def compute_comparison_score(metrics: ImageMetrics, fd: FileExifData = None) -> tuple:
+NOISE_WEIGHT = 1.0
+SHARPNESS_WEIGHT = 1.5
+DEFECT_WEIGHT = 0.1
+EXPOSURE_WEIGHT = 0.1
+SHAKE_PENALTY = 30.0
+MOTION_PENALTY = 20.0
+
+
+def compute_comparison_score(metrics: ImageMetrics, fd: FileExifData = None) -> float:
     """
-    Step 3: Compute comparison score for ranking.
+    Step 3: Compute comparison score for ranking (higher = better).
 
-    Primary:   noise_curve - exposure_push_penalty (higher = better)
-              (images needing heavy brightening are penalized)
-    Secondary: defect_score (higher = fewer defects)
-    Tertiary:  sharpness_curve (higher = sharper)
-    Quartary:  exposure_score (higher = better exposed)
-    + DRC bonus/malus
+    Weighted sum:
+      noise_curve × NOISE_WEIGHT
+      + sharpness_curve × SHARPNESS_WEIGHT
+      + defect_score × DEFECT_WEIGHT
+      + exposure_score × EXPOSURE_WEIGHT
+      + DRC bonus/malus
+      − exposure correction penalty
+      − unrecoverable blur penalty
 
-    The exposure push penalty scales continuously: +0.3 EV → ~1pt,
-    +1.0 EV → 3pt, +2.0+ EV → capped at 15pt. This naturally
-    favors slightly-overexposed images (pulled down = no penalty)
-    over underexposed ones (pushed up = heavy penalty).
-
-    Returns:
-        (noise_ranked, defect_score, sharpness_ranked, exposure_score)
-        for sorting
+    Sharpness is weighted 1.5× over noise so that visible blur
+    outweighs minor noise differences — unless the blur is
+    recoverable (defocus/soft) and the scene benefits from it.
     """
     ev_diff_val = fd.ev_diff if fd else 0.0
     penalty = exposure_correction_penalty(ev_diff_val)
-    noise_ranked = noise_curve(metrics.noise_score) - penalty
-    sharpness_ranked = sharpness_curve(metrics.sharpness_score)
 
+    score = (
+        noise_curve(metrics.noise_score) * NOISE_WEIGHT
+        + sharpness_curve(metrics.sharpness_score) * SHARPNESS_WEIGHT
+        + metrics.defect_score * DEFECT_WEIGHT
+        + metrics.exposure_score * EXPOSURE_WEIGHT
+        - penalty
+    )
+
+    # DRC bonus/malus
     drc_bonus = compute_drc_bonus(fd) if fd else 0.0
-    return (noise_ranked + drc_bonus, metrics.defect_score,
-            sharpness_ranked, metrics.exposure_score)
+    score += drc_bonus
+
+    # Unrecoverable blur penalty (safety net beyond hard filters)
+    if not metrics.blur_recoverable:
+        if metrics.blur_type == "shake":
+            score -= SHAKE_PENALTY
+        elif metrics.blur_type == "motion":
+            score -= MOTION_PENALTY
+
+    return score
 
 
 def select_best_in_group(
@@ -237,8 +260,8 @@ def select_best_in_group(
     tie_warning = ""
 
     if len(scored) >= 2:
-        top_score = scored[0][0][0]
-        second_score = scored[1][0][0]
+        top_score = scored[0][0]
+        second_score = scored[1][0]
         if top_score > 0 and second_score > 0:
             diff_pct = abs(top_score - second_score) / max(top_score, second_score) * 100
             if diff_pct < TIE_THRESHOLD_PCT:
@@ -576,13 +599,39 @@ def select_from_single(
     return kept, decisions
 
 
+def find_pp3_sidecars(filepath: Path, temp_dir: Path = None) -> list[Path]:
+    """
+    Find associated pp3 sidecar files for a CR2.
+    Checks: source dir, _drc.pp3, _exposure_corrected.pp3
+    """
+    found = []
+    stem = filepath.stem
+    base = filepath.parent
+
+    search_paths = [
+        base / f"{stem}.pp3",
+        base / f"{stem}_drc.pp3",
+        base / f"{stem}_exposure_corrected.pp3",
+    ]
+    if temp_dir:
+        search_paths.extend([
+            temp_dir / "drc" / f"{stem}_drc.pp3",
+            temp_dir / "corrected" / f"{stem}_exposure_corrected.pp3",
+        ])
+    for sp in search_paths:
+        if sp.exists():
+            found.append(sp)
+    return found
+
+
 def upload_files(
     files: list[Path],
     nc_client: NextcloudClient,
     remote_dir: str,
+    temp_dir: Path = None,
 ) -> tuple[int, int]:
     """
-    Upload files to Nextcloud.
+    Upload files (CR2 + associated pp3 sidecars) to Nextcloud.
 
     Returns:
         (success_count, failed_count)
@@ -605,6 +654,15 @@ def upload_files(
         else:
             logger.error(f"  Upload failed: {filepath.name}")
             failed += 1
+
+        for pp3_path in find_pp3_sidecars(filepath, temp_dir):
+            remote_pp3 = f"{remote_dir}/{pp3_path.name}"
+            if nc_client.upload_file(pp3_path, remote_pp3):
+                logger.info(f"  Uploaded: {pp3_path.name}")
+                success += 1
+            else:
+                logger.error(f"  Upload failed: {pp3_path.name}")
+                failed += 1
 
     return success, failed
 
@@ -705,10 +763,10 @@ def select_and_upload(
         logger.info(f"{'='*60}")
 
     nc_selected_dir = f"{NC_RAW_PATH}/{batch_name}/selected-phase_1"
-    upload_success, upload_failed = upload_files(all_kept, nc_client, nc_selected_dir)
+    upload_success, upload_failed = upload_files(all_kept, nc_client, nc_selected_dir, temp_dir)
 
     nc_rejected_dir = f"{NC_RAW_PATH}/{batch_name}/rejected-phase_1"
-    rej_success, rej_failed = upload_files(all_rejected, nc_client, nc_rejected_dir)
+    rej_success, rej_failed = upload_files(all_rejected, nc_client, nc_rejected_dir, temp_dir)
     upload_success += rej_success
     upload_failed += rej_failed
 

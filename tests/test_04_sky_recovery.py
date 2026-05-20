@@ -26,9 +26,10 @@ class TestAnalyzeHighlights(unittest.TestCase):
         img = Image.fromarray(np.full((100, 100, 3), 128, dtype=np.uint8))
         with tempfile.NamedTemporaryFile(suffix=".jpg") as f:
             img.save(f.name)
-            clip_ratio, detail = analyze_highlights(Path(f.name))
+            clip_ratio, detail, grad_loss = analyze_highlights(Path(f.name))
         self.assertAlmostEqual(clip_ratio, 0.0, places=2)
         self.assertEqual(detail, 0.0)
+        self.assertEqual(grad_loss, 0.0)
 
     def test_clipped_image(self):
         arr = np.full((100, 100, 3), 255, dtype=np.uint8)
@@ -36,7 +37,7 @@ class TestAnalyzeHighlights(unittest.TestCase):
         img = Image.fromarray(arr.astype(np.uint8))
         with tempfile.NamedTemporaryFile(suffix=".jpg") as f:
             img.save(f.name)
-            clip_ratio, detail = analyze_highlights(Path(f.name))
+            clip_ratio, detail, grad_loss = analyze_highlights(Path(f.name))
         self.assertGreater(clip_ratio, 0.2)
 
     def test_partial_clipping(self):
@@ -45,7 +46,7 @@ class TestAnalyzeHighlights(unittest.TestCase):
         img = Image.fromarray(arr.astype(np.uint8))
         with tempfile.NamedTemporaryFile(suffix=".jpg") as f:
             img.save(f.name)
-            clip_ratio, detail = analyze_highlights(Path(f.name))
+            clip_ratio, detail, grad_loss = analyze_highlights(Path(f.name))
         self.assertGreater(clip_ratio, 0.0)
         self.assertLess(clip_ratio, 0.5)
 

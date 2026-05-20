@@ -32,6 +32,7 @@ from modules.overexposure_checker import check_overexposure
 from modules.quality_scorer import compute_all_metrics
 from modules.selector import select_and_upload
 from modules.user_preferences import suggest_brightness_offset, load_preferences, save_preferences
+from modules.nextcloud_client import NextcloudClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,11 +42,32 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def clear_remote_dir(nc_client: NextcloudClient, remote_dir: str):
+    """Delete all files inside a remote directory (keeps the dir itself)."""
+    items = nc_client.list_dir(remote_dir)
+    if not items:
+        logger.info(f"  {remote_dir} is empty, no cleanup needed")
+        return
+    count = 0
+    for item in items:
+        name = item["name"]
+        if name in (".", ".."):
+            continue
+        remote_path = f"{remote_dir}/{name}"
+        if nc_client.delete_file(remote_path):
+            count += 1
+    logger.info(f"  Cleared {count} file(s) from {remote_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Phase 1: Full Batch Selection")
     parser.add_argument("batch", help="Batch folder name in Nextcloud RAW/")
     parser.add_argument("--max-images", type=int, default=0,
                         help="Limit number of images (for testing)")
+    parser.add_argument("--skip-images", type=int, default=0,
+                        help="Skip first N images (for incremental processing)")
+    parser.add_argument("--clear-output", action="store_true",
+                        help="Clear existing selected/rejected folders before upload")
     parser.add_argument("--brightness-offset", type=float, default=None,
                         help="Override learned brightness offset (EV). "
                              "Positive = brighter target. Overrides user_preferences.json.")
@@ -79,6 +101,7 @@ def main():
         nc_client=nc_client,
         batch_name=BATCH_NAME,
         max_images=args.max_images,
+        skip_images=args.skip_images,
     )
 
     if import_result.file_count == 0:
@@ -161,6 +184,11 @@ def main():
 
     metrics_result = compute_all_metrics(groups)
     print(metrics_result.summary())
+
+    # Clear output directories if requested
+    if args.clear_output:
+        for d in [selected_dir, rejected_dir]:
+            clear_remote_dir(nc_client, d)
 
     # Step 7: Selection + Upload
     logger.info("\n" + "=" * 60)

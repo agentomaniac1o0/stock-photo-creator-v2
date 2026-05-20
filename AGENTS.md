@@ -102,10 +102,56 @@ Nextcloud RAW/{batch}/cleaned/
     └─→ Cleanup
 ```
 
+### Session 2026-05-20 — Blur Classification + Weighted Scoring + Photo Metadata Mode
+
+**Analyse Batch-1 (1660–1704):** 45 CR2s, 15 AEB-Gruppen analysiert → 3 kritische Fälle:
+
+| Gruppe | Gewinner (Select) | Verlierer | Problem |
+|--------|------------------|-----------|---------|
+| IMG_1683 | sharp=5, noise=92 | IMG_1681 sharp=85, noise=22 | Shake gewinnt auf Noise |
+| IMG_1704 | sharp=6, noise=93 | IMG_1703 sharp=88, noise=21 | Shake gewinnt auf Noise |
+| IMG_1668 | sharp=9, noise=77 | IMG_1667 sharp=74, noise=24 | DRC verpasst (diffuse Überstrahlung) |
+
+**Änderungen:**
+
+1. **Blur-Klassifikation** (`quality_scorer.py`): `classify_blur_type()` via Sobel Gradienten-Richtungsanalyse
+   - `shake` (unrecoverable): mean gradient mag < 15 + starke Richtungs-Ungleichheit
+   - `motion` (unrecoverable): moderate mag + horizontale/vertikale Dominanz > 50%
+   - `defocus` (recoverable): schwache Gradienten in beide Richtungen
+   - `soft` (recoverable): moderate mag, ausgewogen
+   - `none`: sharpness ≥ 15
+
+2. **Gewichtetes Scoring** (`selector.py`): `NOISE_WEIGHT=1.0`, `SHARPNESS_WEIGHT=1.5`, `DEFECT_WEIGHT=0.1`, `EXPOSURE_WEIGHT=0.1`
+   - Unrecoverable blur: sofortiger hard reject
+   - Zusätzliche Penalty: SHAKE_PENALTY=30, MOTION_PENALTY=20
+   - Tie-Detection auf float-Scores statt tuple-Index
+
+3. **DRC Gradient Loss** (`sky_recovery.py`): `detect_highlight_gradient_loss()` prüft Gradienten-Energie in near-clipped vs mid-tone Regionen
+   - DRC trigger jetzt auch bei `gradient_loss ≥ 0.3` (selbst wenn clipping < 2%)
+   - Fix für diffuse Himmelsüberstrahlung (IMG_1668)
+
+4. **Stock-Image-Pipeline Skill** (`SKILL.md`): Modus 2 umgebaut
+   - Alt: CR2 Batch Pipeline (entfernt)
+   - Neu: Metadaten für entwickelte Stockfotos (GPT Vision, 40-Keywords, EXIF, Sidecar)
+
+5. **pipeline.py**: `--mode photo` + `--batch` für Batch-Folder-Verarbeitung
+   - GPT Vision mit stock-fotografie-spezifischem Prompt
+   - `trim_to_n_with_mix()` für 40-Keyword-Generierung (Phrasen + Singles)
+   - Exiftool EXIF + JSON Sidecar pro Bild + batch_report.json
+
+**Tests:** 136/136 ✅
+
 ### Key Decisions
 
 | Entscheidung | Wahl |
 |-------------|------|
+| Blur-Klassifikation | `classify_blur_type()`: shake/motion = unrecoverable → hard reject; defocus/soft = recoverable → bleibt im Scoring |
+| Weighted Scoring | `noise×1.0 + sharpness×1.5 + defects×0.1 + exposure×0.1` (sharpness dominant) |
+| Shake Penalty | -30 Punkte für shake, -20 für motion (zusätzlich zum hard reject) |
+| DRC Gradient Loss | `gradient_loss ≥ 0.3` triggert DRC auch ohne Clipping (diffuse Überstrahlung) |
+| Blur Thresholds | `SHAKE_MAG_THRESHOLD=15.0`, `BALANCE_THRESHOLD=0.65`, `MOTION_RATIO=0.5` |
+| Photo Metadata Mode | `--mode photo` in pipeline.py: GPT Vision + 40 Keywords + EXIF + Sidecar, keine Bildverarbeitung |
+| Keyword Verarbeitung | `trim_to_n_with_mix()`: max 12 Phrasen + Rest Singles, Alphabetisch, Duplikat-frei |
 | Bracket-Erkennung | Zwei Modi: AEB (unterschiedliche ExposureTime/EV) vs. Burst (gleiche EV) |
 | Erkennungskriterium | EXIF ExposureCompensation (Fraction-Parsing) + ExposureTime + 0-3s Zeitfenster |
 | Belichtungsangleich | ALLE AEB-Bilder an beste Tonkurve angleichen |

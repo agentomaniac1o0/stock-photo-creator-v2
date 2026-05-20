@@ -39,6 +39,7 @@ def import_raw_files(
     batch_name: str,
     temp_dir: Path = None,
     max_images: int = 0,
+    skip_images: int = 0,
 ) -> ImportResult:
     """
     Download RAW files from Nextcloud to local temp directory.
@@ -48,6 +49,7 @@ def import_raw_files(
         batch_name: Name of the batch folder (e.g. "Barcelona_Trip")
         temp_dir: Optional custom temp directory
         max_images: Limit number of images (0 = no limit, for testing)
+        skip_images: Skip first N images (for incremental processing)
 
     Returns:
         ImportResult with list of local file paths
@@ -63,17 +65,21 @@ def import_raw_files(
 
     items = nc_client.list_dir(nc_path)
     if not items:
-        # Try as subfolder of RAW
         nc_path = f"{NC_RAW_PATH}/{batch_name}"
         items = nc_client.list_dir(nc_path)
 
     downloaded = []
+    skipped = 0
     raw_extensions = RAW_EXTENSIONS | JPEG_EXTENSIONS
 
     for item in items:
         name = item["name"]
         ext = Path(name).suffix.lower()
         if ext not in raw_extensions:
+            continue
+
+        if skip_images > 0 and skipped < skip_images:
+            skipped += 1
             continue
 
         remote_file = f"{nc_path}/{name}"
@@ -86,7 +92,6 @@ def import_raw_files(
         if max_images > 0 and len(downloaded) >= max_images:
             break
 
-    # If no files found in main folder, check subfolders
     if not downloaded:
         for item in items:
             if "/" in item["name"]:
@@ -98,6 +103,9 @@ def import_raw_files(
                 ext = Path(name).suffix.lower()
                 if ext not in raw_extensions:
                     continue
+                if skip_images > 0 and skipped < skip_images:
+                    skipped += 1
+                    continue
                 remote_file = f"{sub_path}/{name}"
                 local_file = raw_dir / name
                 if nc_client.download_file(remote_file, local_file):
@@ -107,6 +115,9 @@ def import_raw_files(
                     break
             if max_images > 0 and len(downloaded) >= max_images:
                 break
+
+    if skip_images > 0:
+        logger.info(f"Skipped {skipped} file(s)")
 
     logger.info(f"Import complete: {len(downloaded)} files → {raw_dir}")
     return ImportResult(raw_files=downloaded, temp_dir=temp_dir, batch_name=batch_name)

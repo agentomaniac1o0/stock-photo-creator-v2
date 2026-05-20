@@ -19,6 +19,7 @@ from typing import Optional
 
 import numpy as np
 from PIL import Image
+from scipy.ndimage import convolve as scipy_convolve
 
 try:
     import rawpy
@@ -46,6 +47,7 @@ class DRCResult:
     clipping_before: float
     highlight_detail_before: float
     strength_used: float
+    gradient_loss: float = 0.0
     reason: str = ""
 
     @property
@@ -106,14 +108,54 @@ def load_image_for_analysis(filepath: Path) -> np.ndarray:
     return np.array(img)
 
 
-def analyze_highlights(filepath: Path) -> tuple[float, float]:
+def detect_highlight_gradient_loss(arr: np.ndarray) -> float:
+    """
+    Detect detail loss in clipped highlights using gradient analysis.
+
+    Measures the ratio of gradient energy in near-clipped vs mid-tone regions.
+    A high ratio (>0.3) means highlights have lost detail that DRC could recover.
+
+    Args:
+        arr: RGB uint8 array (H, W, 3)
+
+    Returns:
+        loss_score: 0.0 (no loss) to 1.0 (severe highlight detail loss)
+    """
+    try:
+        gray = np.mean(arr.astype(np.float64), axis=2)
+
+        sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
+        sobel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float64)
+        gx = scipy_convolve(gray, sobel_x)
+        gy = scipy_convolve(gray, sobel_y)
+        gradient_mag = np.sqrt(gx ** 2 + gy ** 2)
+
+        near_clip = gray > 230
+        mid_tones = (gray > 60) & (gray < 180)
+
+        if not np.any(near_clip) or not np.any(mid_tones):
+            return 0.0
+
+        clip_grad = float(np.mean(gradient_mag[near_clip]))
+        mid_grad = float(np.mean(gradient_mag[mid_tones]))
+
+        if mid_grad < 1.0:
+            return 0.0
+
+        loss_ratio = 1.0 - (clip_grad / mid_grad)
+        return max(0.0, min(1.0, loss_ratio))
+    except Exception:
+        return 0.0
+
+
+def analyze_highlights(filepath: Path) -> tuple[float, float, float]:
     """
     Analyze highlight clipping in an image.
 
     For RAW files, uses rawpy for accurate highlight analysis.
 
     Returns:
-        (clipping_ratio, highlight_detail_ratio)
+        (clipping_ratio, highlight_detail_ratio, gradient_loss_score)
     """
     try:
         arr = load_image_for_analysis(filepath)
@@ -124,7 +166,7 @@ def analyze_highlights(filepath: Path) -> tuple[float, float]:
 
         total = luminance.size
         if total == 0:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0.0
 
         clipped_mask = luminance >= 250
         clipping_ratio = float(np.sum(clipped_mask)) / total
@@ -138,11 +180,13 @@ def analyze_highlights(filepath: Path) -> tuple[float, float]:
         else:
             highlight_detail = 0.0
 
-        return clipping_ratio, highlight_detail
+        gradient_loss = detect_highlight_gradient_loss(arr)
+
+        return clipping_ratio, highlight_detail, gradient_loss
 
     except Exception as e:
         logger.warning(f"Highlight analysis error for {filepath.name}: {e}")
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
 
 
 def write_drc_pp3(
@@ -187,6 +231,9 @@ Method=1
         return False
 
 
+DRC_GRADIENT_LOSS_THRESHOLD = 0.3
+
+
 def try_drc_recovery(
     filepath: Path,
     output_dir: Path,
@@ -198,15 +245,21 @@ def try_drc_recovery(
     Strategy:
     1. Analyze highlight clipping on RAW (via rawpy)
     2. If clipping > threshold AND highlight detail exists → write DRC pp3
-    3. If no clipping → no DRC needed
-    4. If clipping but no detail → DRC won't help
+    3. If clipping < 2% BUT gradient loss > threshold → still try DRC
+       (catches cases like 1668 where clipping is diffuse but detail is lost)
+    4. If no clipping and no gradient loss → no DRC needed
+    5. If clipping but no detail and no gradient → DRC won't help
 
     Returns:
         DRCResult with outcome
     """
-    clipping_ratio, detail_before = analyze_highlights(filepath)
+    clipping_ratio, detail_before, gradient_loss = analyze_highlights(filepath)
 
-    if clipping_ratio < DRC_CLIPPING_THRESHOLD:
+    has_clipping = clipping_ratio >= DRC_CLIPPING_THRESHOLD
+    has_detail = detail_before >= DRC_HIGHLIGHT_DETAIL_MIN
+    has_gradient_loss = gradient_loss >= DRC_GRADIENT_LOSS_THRESHOLD
+
+    if not has_clipping and not has_gradient_loss:
         return DRCResult(
             filepath=filepath,
             pp3_path=None,
@@ -215,10 +268,11 @@ def try_drc_recovery(
             clipping_before=clipping_ratio,
             highlight_detail_before=detail_before,
             strength_used=0,
-            reason=f"No DRC needed ({clipping_ratio*100:.1f}% clipped)",
+            reason=f"No DRC needed ({clipping_ratio*100:.1f}% clipped, "
+                   f"gradient_loss={gradient_loss:.2f})",
         )
 
-    if detail_before < DRC_HIGHLIGHT_DETAIL_MIN:
+    if has_clipping and not has_detail and not has_gradient_loss:
         return DRCResult(
             filepath=filepath,
             pp3_path=None,
@@ -229,6 +283,13 @@ def try_drc_recovery(
             strength_used=0,
             reason=f"DRC skipped: no detail in highlights ({detail_before:.3f})",
         )
+
+    # Trigger reason for reporting
+    trigger = "clipping"
+    if has_gradient_loss and not has_clipping:
+        trigger = "gradient_loss"
+    elif has_clipping and has_gradient_loss:
+        trigger = "clipping+gradient_loss"
 
     stem = filepath.stem
     pp3_path = output_dir / f"{stem}_drc.pp3"
@@ -247,21 +308,6 @@ def try_drc_recovery(
             reason=f"DRC failed (technical error)",
         )
 
-    # Re-analyze after DRC to confirm improvement
-    _, detail_after = analyze_highlights(filepath)
-
-    if detail_after <= detail_before:
-        return DRCResult(
-            filepath=filepath,
-            pp3_path=pp3_path,
-            drc_applied=True,
-            drc_success=False,
-            clipping_before=clipping_ratio,
-            highlight_detail_before=detail_before,
-            strength_used=max_strength,
-            reason=f"DRC unsuccessful: detail won't improve ({detail_before:.3f})",
-        )
-
     return DRCResult(
         filepath=filepath,
         pp3_path=pp3_path,
@@ -270,8 +316,8 @@ def try_drc_recovery(
         clipping_before=clipping_ratio,
         highlight_detail_before=detail_before,
         strength_used=max_strength,
-        reason=f"DRC OK via pp3: detail {detail_before:.3f} "
-               f"(HighlightCompr in pp3)",
+        reason=f"DRC OK via pp3: HighlightCompr={int(max_strength * 5)} "
+               f"(trigger={trigger}, gradient_loss={gradient_loss:.2f})",
     )
 
 
@@ -310,9 +356,9 @@ def recover_highlights(
             elif result.drc_applied and not result.drc_success:
                 drc_fail += 1
 
-            # Keep original CR2 filepath — only update DRC flags
             fd.drc_applied = result.drc_applied
             fd.drc_success = result.drc_success
+            fd.drc_pp3_path = result.pp3_path
             updated_files.append(fd)
 
         group.files = updated_files
